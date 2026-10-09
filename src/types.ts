@@ -252,6 +252,13 @@ export interface RequestOptions {
   /** Overrides (merged with) the client retry policy; `false` disables retries. */
   retry?: RetryOptions | false;
   headers?: Record<string, string>;
+  /**
+   * Sent as the `Idempotency-Key` header (replacing one in `headers`). It marks this POST as
+   * safe to retry, so it is retried like a GET (502 included). Use a fresh unique value per
+   * logical request. The gateway does not deduplicate on this key yet, so a retry after a
+   * 502 can still run the request twice upstream.
+   */
+  idempotencyKey?: string;
   /** Extra JSON fields merged into the request body (after typed params, before `caliban`). */
   extraBody?: Record<string, unknown>;
 }

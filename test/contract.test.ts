@@ -1,6 +1,8 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { components, paths } from '../src/generated/schema.js';
 import type {
+  ApiKeyInfo,
+  ApiKeyListOptions,
   CalibanExtension,
   ChatCompletion,
   ChatCompletionCreateParams,
@@ -19,6 +21,8 @@ import type {
   RerankResult,
   SharedProvider,
   SharedProviderCreate,
+  Tenant,
+  TenantListOptions,
   TrustTier,
 } from '../src/index.js';
 
@@ -72,6 +76,20 @@ describe('contract alignment (type-level)', () => {
     // The admin endpoints the helpers call exist in the contract.
     expectTypeOf<paths['/api/v1/models/{modelId}']['delete']>().not.toBeNever();
     expectTypeOf<paths['/api/v1/providers/{providerId}/discover']['post']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}']['delete']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/api-keys/{keyId}']['delete']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/datasources/{datasourceId}']['delete']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/nodes/{nodeId}']['delete']>().not.toBeNever();
+    // Soft-delete fields and list options.
+    expectTypeOf<Tenant['status']>().toEqualTypeOf<'active' | 'deleted' | undefined>();
+    expectTypeOf<Tenant['deleted_at']>().toEqualTypeOf<string | null | undefined>();
+    expectTypeOf<ApiKeyInfo['revoked_at']>().toEqualTypeOf<string | null | undefined>();
+    expectTypeOf<TenantListOptions['include_deleted']>().toEqualTypeOf<
+      NonNullable<paths['/api/v1/tenants']['get']['parameters']['query']>['include_deleted']
+    >();
+    expectTypeOf<ApiKeyListOptions['include_revoked']>().toEqualTypeOf<
+      NonNullable<paths['/api/v1/tenants/{tenantId}/api-keys']['get']['parameters']['query']>['include_revoked']
+    >();
 
     for (const f of [embToContract, embFromContract, completionToContract, modelsToContract]) expect(typeof f).toBe('function');
   });

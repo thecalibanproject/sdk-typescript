@@ -398,10 +398,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List tenants */
+        /**
+         * List tenants
+         * @description Active tenants. Deleted tenants (tombstones) are included only with `include_deleted=true`.
+         */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    include_deleted?: boolean;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -460,7 +465,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Get a tenant */
+        /**
+         * Get a tenant
+         * @description A deleted tenant is a 404.
+         */
         get: {
             parameters: {
                 query?: never;
@@ -486,7 +494,37 @@ export interface paths {
         };
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete a tenant (tombstone)
+         * @description In one audited transaction (`tenant.delete`): the tenant becomes a tombstone
+         *     (`status: deleted`, `deleted_at` set), all its API keys are revoked, its BYOK provider
+         *     credentials are destroyed (sealed ciphertext removed), its routes are removed, and its
+         *     datasources (connection settings wiped) and nodes are soft-deleted. The tenant leaves the
+         *     data-plane snapshot, so routers reject its keys from their next snapshot. Audit rows are
+         *     kept. The tenant id cannot be reused (`POST /api/v1/tenants` with the same name is a 409).
+         *     Every tenant-scoped endpoint returns 404 for a deleted tenant.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
         options?: never;
         head?: never;
         patch?: never;
@@ -501,10 +539,15 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List the tenant's Caliban API keys (metadata only) */
+        /**
+         * List the tenant's Caliban API keys (metadata only)
+         * @description Active keys. Revoked keys (with `revoked_at`) are included only with `include_revoked=true`.
+         */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    include_revoked?: boolean;
+                };
                 header?: never;
                 path: {
                     tenantId: components["parameters"]["TenantId"];
@@ -522,6 +565,7 @@ export interface paths {
                         "application/json": components["schemas"]["ApiKeyInfo"][];
                     };
                 };
+                404: components["responses"]["Error"];
             };
         };
         put?: never;
@@ -555,6 +599,144 @@ export interface paths {
             };
         };
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/api-keys/{keyId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                keyId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke a Caliban API key
+         * @description Soft revoke (`api_key.revoke` audit row): the key keeps its row with `revoked_at` set and
+         *     its hash leaves the data-plane snapshot. A standalone deployment rejects the key (401) on
+         *     the next request; a split-mode router rejects it after its next snapshot poll
+         *     (`CALIBAN_SNAPSHOT_POLL_SECS`, default 10 s). A revoked key's hash can never be reused.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    keyId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Revoked */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/datasources/{datasourceId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                datasourceId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a datasource
+         * @description Soft delete (`datasource.delete` audit row), scoped to the tenant in the path: the row is
+         *     kept with its stored connection settings wiped, it is no longer listed or introspectable,
+         *     and its name can be used again.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    datasourceId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a node version
+         * @description Soft-deletes one node version (`node.delete` audit row), scoped to the tenant in the path.
+         *     It is no longer listed; its version number is not reused by later versions.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
         options?: never;
         head?: never;
         patch?: never;
@@ -1597,6 +1779,13 @@ export interface components {
             pii_default?: "off" | "mask" | "reversible";
             /** Format: date-time */
             created_at: string;
+            /**
+             * @description `deleted` only appears with `include_deleted=true`.
+             * @enum {string}
+             */
+            status?: "active" | "deleted";
+            /** Format: date-time */
+            deleted_at?: string | null;
         };
         TenantCreate: {
             name: string;
@@ -1614,6 +1803,11 @@ export interface components {
             prefix: string;
             /** Format: date-time */
             created_at: string;
+            /**
+             * Format: date-time
+             * @description Set once the key is revoked.
+             */
+            revoked_at?: string | null;
         };
         ApiKeyCreated: components["schemas"]["ApiKeyInfo"] & {
             /** @description Plaintext key. Shown once. */
@@ -1644,7 +1838,7 @@ export interface components {
             /** @description Provider id referenced by the model catalogue (e.g. local-llm, openai). Defaults to the slugified label. */
             provider_id?: string;
             base_url?: string;
-            /** @description Write-only. Encrypted with the tenant DEK. Optional for keyless local endpoints. */
+            /** @description Write-only. Sealed under CALIBAN_KEK. Optional for keyless local endpoints. */
             api_key?: string;
             trust_tier: components["schemas"]["TrustTier"];
             /**

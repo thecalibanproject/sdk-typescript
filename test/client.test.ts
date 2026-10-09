@@ -274,7 +274,7 @@ describe('error mapping', () => {
 describe('retry policy', () => {
   const rateLimited = () => json({ error: { message: 'slow down', type: 'rate_limited' } }, { status: 429 });
 
-  it.each([429, 502, 503])('retries %i then succeeds', async (status) => {
+  it.each([429, 503])('retries %i on POST then succeeds', async (status) => {
     const m = mockFetch(new Response('{}', { status }), json(completion));
     const res = await client(m.fetch).chat.completions.create({ model: 'm', messages: msgs });
     expect(res.id).toBe('chatcmpl-1');
@@ -282,7 +282,111 @@ describe('retry policy', () => {
     expect(m.calls[1]!.body).toBe(m.calls[0]!.body); // body re-sent intact
   });
 
-  it.each([400, 401, 403, 404, 500, 504])('does not retry %i', async (status) => {
+  it('does not retry a POST on 502: the upstream may already have run it', async () => {
+    const m = mockFetch(json({ error: { message: 'bad gateway', type: 'upstream_error' } }, { status: 502 }), json(completion));
+    const err = await client(m.fetch).chat.completions.create({ model: 'm', messages: msgs }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 502, type: 'upstream_error' });
+    expect(m.calls).toHaveLength(1);
+  });
+
+  it('retries a POST 429 after the retry-after delay', async () => {
+    const m = mockFetch(
+      json({ error: { message: 'slow down', type: 'rate_limited' } }, { status: 429, headers: { 'retry-after': '0.02' } }),
+      json(completion),
+    );
+    // Computed backoff would be 60 s, so finishing quickly proves retry-after (20 ms) was used.
+    const started = Date.now();
+    await client(m.fetch, { retry: { initialDelayMs: 60_000, jitter: false } }).chat.completions.create({
+      model: 'm',
+      messages: msgs,
+    });
+    const elapsed = Date.now() - started;
+    expect(m.calls).toHaveLength(2);
+    expect(elapsed).toBeGreaterThanOrEqual(15);
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  it.each([429, 502, 503])('retries %i on GET then succeeds', async (status) => {
+    const m = mockFetch(new Response('{}', { status }), json({ object: 'list', data: [] }));
+    await client(m.fetch).models.list();
+    expect(m.calls).toHaveLength(2);
+    expect(m.calls.every((c) => c.method === 'GET')).toBe(true);
+  });
+
+  it('retries a POST with an idempotencyKey on 502 and sends the same key each time', async () => {
+    const m = mockFetch(new Response('{}', { status: 502 }), json(completion));
+    await client(m.fetch).chat.completions.create({ model: 'm', messages: msgs }, { idempotencyKey: 'req-123' });
+    expect(m.calls).toHaveLength(2);
+    expect(m.calls.map((c) => c.headers.get('idempotency-key'))).toEqual(['req-123', 'req-123']);
+  });
+
+  it('treats an Idempotency-Key header (any case) like the idempotencyKey option', async () => {
+    const m = mockFetch(new Response('{}', { status: 502 }), json(completion));
+    await client(m.fetch).chat.completions.create(
+      { model: 'm', messages: msgs },
+      { headers: { 'Idempotency-Key': 'hdr-1' } },
+    );
+    expect(m.calls).toHaveLength(2);
+    expect(m.calls[1]!.headers.get('idempotency-key')).toBe('hdr-1');
+  });
+
+  it('sends no Idempotency-Key unless the caller asks for one', async () => {
+    const m = mockFetch(json(completion));
+    await client(m.fetch).chat.completions.create({ model: 'm', messages: msgs });
+    expect(m.calls[0]!.headers.has('idempotency-key')).toBe(false);
+  });
+
+  it('does not retry a POST whose connection failed after the request was sent', async () => {
+    const afterSend = () =>
+      Promise.reject(new TypeError('fetch failed', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }));
+    const m = mockFetch(afterSend, json(completion));
+    const err = await client(m.fetch, { retry: { ...fastRetry, retryOnNetworkError: true } })
+      .chat.completions.create({ model: 'm', messages: msgs })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CalibanConnectionError);
+    expect(m.calls).toHaveLength(1);
+    // The same failure on a GET, or on a POST with an Idempotency-Key, is retried.
+    const m2 = mockFetch(afterSend, json({ object: 'list', data: [] }));
+    await client(m2.fetch, { retry: { ...fastRetry, retryOnNetworkError: true } }).models.list();
+    expect(m2.calls).toHaveLength(2);
+    const m3 = mockFetch(afterSend, json(completion));
+    await client(m3.fetch, { retry: { ...fastRetry, retryOnNetworkError: true } }).chat.completions.create(
+      { model: 'm', messages: msgs },
+      { idempotencyKey: 'k' },
+    );
+    expect(m3.calls).toHaveLength(2);
+  });
+
+  it('retries a POST whose connection was never established', async () => {
+    const refused = () => {
+      const agg = Object.assign(new AggregateError([Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })]), {
+        code: 'ECONNREFUSED',
+      });
+      return Promise.reject(new TypeError('fetch failed', { cause: agg }));
+    };
+    const m = mockFetch(refused, json(completion));
+    await client(m.fetch, { retry: { ...fastRetry, retryOnNetworkError: true } }).chat.completions.create({
+      model: 'm',
+      messages: msgs,
+    });
+    expect(m.calls).toHaveLength(2);
+  });
+
+  it('does not retry a POST that timed out', async () => {
+    const m = mockFetch(
+      (call) =>
+        new Promise<Response>((_, reject) => {
+          call.signal?.addEventListener('abort', () => reject(call.signal?.reason ?? new Error('aborted')));
+        }),
+    );
+    const err = await client(m.fetch, { timeoutMs: 10, retry: { ...fastRetry, retryOnNetworkError: true } })
+      .chat.completions.create({ model: 'm', messages: msgs })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CalibanTimeoutError);
+    expect(m.calls).toHaveLength(1);
+  });
+
+  it.each([400, 401, 403, 404, 500, 502, 504])('does not retry %i on POST', async (status) => {
     const m = mockFetch(new Response('{}', { status }), json(completion));
     await expect(client(m.fetch).chat.completions.create({ model: 'm', messages: msgs })).rejects.toMatchObject({
       status,
@@ -315,6 +419,18 @@ describe('retry policy', () => {
       messages: msgs,
     });
     expect(m.calls).toHaveLength(2);
+  });
+
+  it('applies an explicit retryOnStatus to POSTs as-is, 502 included (client and per-request)', async () => {
+    const m1 = mockFetch(new Response('{}', { status: 502 }), json(completion));
+    await client(m1.fetch, { retry: { ...fastRetry, retryOnStatus: [429, 502, 503] } }).chat.completions.create({
+      model: 'm',
+      messages: msgs,
+    });
+    expect(m1.calls).toHaveLength(2);
+    const m2 = mockFetch(new Response('{}', { status: 502 }), json(completion));
+    await client(m2.fetch).chat.completions.create({ model: 'm', messages: msgs }, { retry: { retryOnStatus: [502] } });
+    expect(m2.calls).toHaveLength(2);
   });
 
   it('does not retry network errors by default, but does when enabled', async () => {

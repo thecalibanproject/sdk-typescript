@@ -5,7 +5,7 @@ import {
   CalibanTimeoutError,
   errorFromResponse,
 } from '../errors.js';
-import { computeRetryDelay, shouldRetryStatus, type RetryPolicy } from '../retry.js';
+import { computeRetryDelay, isIdempotentRequest, shouldRetryStatus, type RetryPolicy } from '../retry.js';
 
 /**
  * Owns the AbortController for one attempt: links the caller's signal and an optional
@@ -70,6 +70,12 @@ export class RequestLifetime {
 
 export interface SendOptions {
   retry: RetryPolicy;
+  /**
+   * Whether the request is safe to repeat (idempotent method, or a POST with an
+   * `Idempotency-Key`). Non-idempotent requests are retried only on 429/503 (unless
+   * `retryOnStatus` was set explicitly) and only on connect failures.
+   */
+  idempotent: boolean;
   timeoutMs?: number | undefined;
   signal?: AbortSignal | undefined;
   /** Throw a CalibanAPIError for non-2xx (default). When false, the final response is returned as-is. */
@@ -99,6 +105,39 @@ export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> 
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+/**
+ * Error codes that mean the connection was never established, so the request was never
+ * sent. Node's fetch (undici) puts them on `err.cause.code`; a happy-eyeballs failure is an
+ * AggregateError carrying the same code. A reset after sending surfaces as
+ * `UND_ERR_SOCKET` and is deliberately absent. Browsers expose no cause, so there a failed
+ * POST is never treated as unsent.
+ */
+const CONNECT_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EADDRNOTAVAIL',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+/** True when a fetch rejection provably happened before the request was sent. */
+export function isConnectFailure(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let cur: unknown = err;
+  while (cur && typeof cur === 'object' && !seen.has(cur)) {
+    seen.add(cur);
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === 'string' && CONNECT_FAILURE_CODES.has(code)) return true;
+    if (cur instanceof AggregateError && cur.errors.length > 0 && cur.errors.every((e) => isConnectFailure(e))) {
+      return true;
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 function discardBody(response: Response): void {
@@ -133,7 +172,9 @@ export async function sendWithRetry(
       lifetime.dispose();
       const mapped = lifetime.classify(err);
       const networkish = mapped instanceof CalibanConnectionError; // includes timeouts
-      if (networkish && retry.retryOnNetworkError && i < retry.maxRetries) {
+      // A non-idempotent request may have reached the server unless the connect itself failed.
+      const safe = opts.idempotent || (!lifetime.timedOut && isConnectFailure(err));
+      if (networkish && safe && retry.retryOnNetworkError && i < retry.maxRetries) {
         await sleep(computeRetryDelay(retry, i), opts.signal);
         continue;
       }
@@ -142,7 +183,7 @@ export async function sendWithRetry(
 
     if (response.ok) return { response, lifetime };
 
-    if (shouldRetryStatus(retry, response.status) && i < retry.maxRetries) {
+    if (shouldRetryStatus(retry, response.status, opts.idempotent) && i < retry.maxRetries) {
       const delay = computeRetryDelay(retry, i, response.headers);
       discardBody(response);
       lifetime.dispose();
@@ -172,6 +213,7 @@ export function createRetryingFetch(
     const request = new Request(input, init);
     const { response, lifetime } = await sendWithRetry((signal) => baseFetch(new Request(request.clone(), { signal })), {
       retry,
+      idempotent: isIdempotentRequest(request.method, request.headers),
       timeoutMs,
       signal: request.signal,
       throwOnHttpError: false,

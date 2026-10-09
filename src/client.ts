@@ -2,7 +2,7 @@ import { CalibanError } from './errors.js';
 import { readEnv, resolveFetch, trimTrailingSlash } from './internal/env.js';
 import { sendWithRetry } from './internal/http.js';
 import { attachMeta, parseResponseMeta } from './meta.js';
-import { resolveRetryPolicy, type RetryOptions, type RetryPolicy } from './retry.js';
+import { IDEMPOTENCY_KEY_HEADER, isIdempotentRequest, resolveRetryPolicy, type RetryOptions, type RetryPolicy } from './retry.js';
 import { ChatCompletionStream } from './streaming.js';
 import type {
   CalibanExtension,
@@ -35,7 +35,10 @@ export interface CalibanClientOptions {
   baseURL?: string;
   /** Custom fetch (e.g. for proxies or tests). Defaults to `globalThis.fetch`. */
   fetch?: typeof fetch;
-  /** Retry policy; `false` disables retries. Default: 2 retries on 429/502/503. */
+  /**
+   * Retry policy; `false` disables retries. Default: 2 retries on 429/502/503 for GET, and on
+   * 429/503 only for POST without an `Idempotency-Key` (see `RetryOptions.retryOnStatus`).
+   */
   retry?: RetryOptions | false;
   /** Per-attempt timeout. For streams, covers time-to-headers only. Default 600 000 ms. */
   timeoutMs?: number;
@@ -280,6 +283,10 @@ export class CalibanClient {
       ...req.options.headers,
       authorization: `Bearer ${this.apiKey}`,
     };
+    if (req.options.idempotencyKey !== undefined) {
+      for (const k of Object.keys(headers)) if (k.toLowerCase() === IDEMPOTENCY_KEY_HEADER) delete headers[k];
+      headers[IDEMPOTENCY_KEY_HEADER] = req.options.idempotencyKey;
+    }
     if (req.body !== undefined) headers['content-type'] = 'application/json';
     const url = `${this.baseURL}${path}`;
     return sendWithRetry(
@@ -292,6 +299,7 @@ export class CalibanClient {
         }),
       {
         retry: resolveRetryPolicy(req.options.retry, this.retry),
+        idempotent: isIdempotentRequest(req.method, headers),
         timeoutMs: req.options.timeoutMs ?? this.timeoutMs,
         signal: req.options.signal,
       },

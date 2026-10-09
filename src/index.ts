@@ -29,6 +29,9 @@ export {
 export type { CalibanErrorType, CalibanErrorInit, ErrorBody, ErrorObject } from './errors.js';
 export {
   DEFAULT_RETRY_POLICY,
+  NON_IDEMPOTENT_RETRY_STATUSES,
+  IDEMPOTENCY_KEY_HEADER,
+  isIdempotentRequest,
   resolveRetryPolicy,
   computeRetryDelay,
   parseRetryAfter,

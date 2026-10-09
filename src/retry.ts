@@ -1,6 +1,11 @@
 /**
  * Retry policy. Retries apply only to the *request phase*: once a 2xx response has been
  * returned (in particular once a stream has started) nothing is ever retried.
+ *
+ * A POST without an `Idempotency-Key` header is not idempotent: the gateway may already
+ * have run (and billed) it upstream. With the default `retryOnStatus` such a request is
+ * retried only on 429 and 503 (never 500, 502 or 504), and a network error is retried
+ * only when the request provably never left the client (a connect failure).
  */
 export interface RetryOptions {
   /** Retries after the first attempt. Default 2 (so up to 3 attempts). */
@@ -13,11 +18,16 @@ export interface RetryOptions {
   backoffMultiplier?: number;
   /** Randomly shave up to 25% off each delay to avoid thundering herds. Default true. */
   jitter?: boolean;
-  /** HTTP statuses that trigger a retry. Default [429, 502, 503]. */
+  /**
+   * HTTP statuses that trigger a retry. Default [429, 502, 503] for idempotent requests
+   * (GET, HEAD, OPTIONS, PUT, DELETE, or any request with an `Idempotency-Key` header) and
+   * [429, 503] for other POSTs. Setting it applies your list to every request as-is.
+   */
   retryOnStatus?: readonly number[];
   /**
-   * Also retry when the request fails before any response (DNS, reset, timeout).
-   * Default false: chat completions are not idempotent and may have been billed upstream.
+   * Also retry when the request fails before any response (DNS, refused, reset, timeout).
+   * Default false. For a POST without an `Idempotency-Key` only connect failures (the
+   * request was never sent) are retried, since a chat completion may have been billed upstream.
    */
   retryOnNetworkError?: boolean;
   /** Honour `retry-after-ms` / `retry-after` headers (capped at 60 s). Default true. */
@@ -36,6 +46,28 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = Object.freeze({
   retryOnNetworkError: false,
   respectRetryAfter: true,
 });
+
+/**
+ * Statuses retried for a non-idempotent request when `retryOnStatus` is left at its default.
+ * 500, 502 and 504 are excluded: the upstream may already have executed the request.
+ */
+export const NON_IDEMPOTENT_RETRY_STATUSES: readonly number[] = Object.freeze([429, 503]);
+
+const IDEMPOTENT_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']);
+
+/** Header that marks a POST as safe to retry. The gateway does not deduplicate on it yet. */
+export const IDEMPOTENCY_KEY_HEADER = 'idempotency-key';
+
+/**
+ * True for idempotent methods, and for any request carrying an `Idempotency-Key` header
+ * (matched case-insensitively).
+ */
+export function isIdempotentRequest(method: string, headers?: Headers | Record<string, string>): boolean {
+  if (IDEMPOTENT_METHODS.has(method.toUpperCase())) return true;
+  if (!headers) return false;
+  if (headers instanceof Headers) return headers.has(IDEMPOTENCY_KEY_HEADER);
+  return Object.keys(headers).some((k) => k.toLowerCase() === IDEMPOTENCY_KEY_HEADER);
+}
 
 /** Server-provided waits longer than this are ignored in favour of computed backoff. */
 export const MAX_RETRY_AFTER_MS = 60_000;
@@ -90,6 +122,15 @@ export function computeRetryDelay(
   return policy.jitter ? Math.round(exp * (1 - 0.25 * random())) : exp;
 }
 
-export function shouldRetryStatus(policy: RetryPolicy, status: number): boolean {
-  return policy.retryOnStatus.includes(status);
+/**
+ * Whether `status` should be retried. A non-idempotent request uses
+ * {@link NON_IDEMPOTENT_RETRY_STATUSES} unless the caller set `retryOnStatus` explicitly
+ * (an explicit list never shares identity with the frozen default array).
+ */
+export function shouldRetryStatus(policy: RetryPolicy, status: number, idempotent = true): boolean {
+  const statuses =
+    !idempotent && policy.retryOnStatus === DEFAULT_RETRY_POLICY.retryOnStatus
+      ? NON_IDEMPOTENT_RETRY_STATUSES
+      : policy.retryOnStatus;
+  return statuses.includes(status);
 }

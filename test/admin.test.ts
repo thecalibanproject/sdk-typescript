@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CalibanAdmin, CalibanAPIError, defineNode } from '../src/index.js';
+import { CalibanAdmin, CalibanAPIError, CalibanConnectionError, defineNode } from '../src/index.js';
 import { fastRetry, json, mockFetch } from './helpers.js';
 
 const tenant = { id: 't_1', name: 'Acme', region: null, pii_default: 'reversible', created_at: '2026-10-02T00:00:00Z' };
@@ -96,6 +96,106 @@ describe('CalibanAdmin', () => {
     await admin(m.fetch).tenants.create({ name: 'Acme' });
     expect(m.calls).toHaveLength(2);
     expect(m.calls[1]!.body).toBe(m.calls[0]!.body);
+  });
+
+  it('retries GET and DELETE on 502', async () => {
+    const m = mockFetch(new Response('', { status: 502 }), json([tenant]));
+    expect(await admin(m.fetch).tenants.list()).toHaveLength(1);
+    expect(m.calls).toHaveLength(2);
+    const d = mockFetch(new Response('', { status: 502 }), new Response(null, { status: 204 }));
+    await admin(d.fetch).providers.delete('p1');
+    expect(d.calls.map((c) => c.method)).toEqual(['DELETE', 'DELETE']);
+  });
+
+  it('does not retry a POST on 502, but retries 429 and 503', async () => {
+    const bad = mockFetch(json({ error: { message: 'u', type: 'upstream_error' } }, { status: 502 }), json(tenant, { status: 201 }));
+    await expect(admin(bad.fetch).tenants.create({ name: 'Acme' })).rejects.toMatchObject({ status: 502 });
+    expect(bad.calls).toHaveLength(1);
+    const limited = mockFetch(new Response('', { status: 429, headers: { 'retry-after': '0' } }), json(tenant, { status: 201 }));
+    await admin(limited.fetch).tenants.create({ name: 'Acme' });
+    expect(limited.calls).toHaveLength(2);
+  });
+
+  it('retries a POST carrying an Idempotency-Key header on 502', async () => {
+    const m = mockFetch(new Response('', { status: 502 }), json(tenant, { status: 201 }));
+    await admin(m.fetch).tenants.create({ name: 'Acme' }, { headers: { 'Idempotency-Key': 'tenant-acme' } });
+    expect(m.calls).toHaveLength(2);
+    expect(m.calls[1]!.headers.get('idempotency-key')).toBe('tenant-acme');
+  });
+
+  it('does not retry a POST whose connection failed after the request was sent', async () => {
+    const afterSend = () =>
+      Promise.reject(new TypeError('fetch failed', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }));
+    const m = mockFetch(afterSend, json(tenant, { status: 201 }));
+    const a = new CalibanAdmin({ token: 't', baseUrl: 'http://cp:8081', fetch: m.fetch, retry: { ...fastRetry, retryOnNetworkError: true } });
+    await expect(a.tenants.create({ name: 'Acme' })).rejects.toBeInstanceOf(CalibanConnectionError);
+    expect(m.calls).toHaveLength(1);
+  });
+
+  it('deletes tenants, revokes api keys and deletes datasources and nodes (204 resolves to undefined)', async () => {
+    const m = mockFetch(new Response(null, { status: 204 }));
+    const a = admin(m.fetch);
+    await expect(a.tenants.delete('t_1')).resolves.toBeUndefined();
+    await expect(a.apiKeys.revoke('t_1', 'k1')).resolves.toBeUndefined();
+    await expect(a.datasources.delete('t_1', 'ds1')).resolves.toBeUndefined();
+    await expect(a.nodes.delete('t_1', 'n/1')).resolves.toBeUndefined();
+    expect(m.calls.map((c) => [c.method, c.url])).toEqual([
+      ['DELETE', 'http://cp:8081/api/v1/tenants/t_1'],
+      ['DELETE', 'http://cp:8081/api/v1/tenants/t_1/api-keys/k1'],
+      ['DELETE', 'http://cp:8081/api/v1/tenants/t_1/datasources/ds1'],
+      ['DELETE', 'http://cp:8081/api/v1/tenants/t_1/nodes/n%2F1'],
+    ]);
+    expect(m.calls.every((c) => c.headers.get('authorization') === 'Bearer adm_secret' && c.body === null)).toBe(true);
+  });
+
+  it.each([
+    ['tenants.delete', (a: CalibanAdmin) => a.tenants.delete('gone')],
+    ['apiKeys.revoke', (a: CalibanAdmin) => a.apiKeys.revoke('t_1', 'gone')],
+    ['datasources.delete', (a: CalibanAdmin) => a.datasources.delete('t_1', 'gone')],
+    ['nodes.delete', (a: CalibanAdmin) => a.nodes.delete('t_1', 'gone')],
+  ])('%s throws a not-found CalibanAPIError on 404 without retrying', async (_name, call) => {
+    const m = mockFetch(
+      json({ error: { message: 'not found', type: 'not_found', code: null } }, { status: 404, headers: { 'x-caliban-request-id': 'r404' } }),
+    );
+    const err = await call(admin(m.fetch)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CalibanAPIError);
+    expect(err).toMatchObject({ status: 404, type: 'not_found', message: 'not found', requestId: 'r404' });
+    expect(m.calls).toHaveLength(1);
+  });
+
+  it('retries the new DELETE routes on 502 like any idempotent request', async () => {
+    const m = mockFetch(new Response('', { status: 502 }), new Response(null, { status: 204 }));
+    await admin(m.fetch).apiKeys.revoke('t_1', 'k1');
+    expect(m.calls.map((c) => c.method)).toEqual(['DELETE', 'DELETE']);
+  });
+
+  it('sends include_deleted and include_revoked only when set', async () => {
+    const deleted = { ...tenant, id: 't_2', status: 'deleted', deleted_at: '2026-10-08T12:00:00Z' };
+    const revoked = { id: 'k1', name: 'ci', prefix: 'cal_abcd', created_at: 'x', revoked_at: '2026-10-08T12:00:00Z' };
+    const m = mockFetch(json([tenant]), json([{ ...tenant, status: 'active', deleted_at: null }, deleted]), json([]), json([revoked]));
+    const a = admin(m.fetch);
+    await a.tenants.list();
+    const all = await a.tenants.list({ include_deleted: true, headers: { 'x-trace': '1' } });
+    await a.apiKeys.list('t_1');
+    const keys = await a.apiKeys.list('t_1', { include_revoked: true });
+    expect(m.calls.map((c) => c.url)).toEqual([
+      'http://cp:8081/api/v1/tenants',
+      'http://cp:8081/api/v1/tenants?include_deleted=true',
+      'http://cp:8081/api/v1/tenants/t_1/api-keys',
+      'http://cp:8081/api/v1/tenants/t_1/api-keys?include_revoked=true',
+    ]);
+    expect(m.calls[1]!.headers.get('x-trace')).toBe('1');
+    expect(all.map((t) => [t.status, t.deleted_at])).toEqual([
+      ['active', null],
+      ['deleted', '2026-10-08T12:00:00Z'],
+    ]);
+    expect(keys[0]?.revoked_at).toBe('2026-10-08T12:00:00Z');
+  });
+
+  it('passes include_deleted=false through when set explicitly', async () => {
+    const m = mockFetch(json([]));
+    await admin(m.fetch).tenants.list({ include_deleted: false });
+    expect(m.calls[0]!.url).toBe('http://cp:8081/api/v1/tenants?include_deleted=false');
   });
 
   it('requires a token', () => {

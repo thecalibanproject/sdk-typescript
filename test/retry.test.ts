@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { computeRetryDelay, DEFAULT_RETRY_POLICY, parseRetryAfter, resolveRetryPolicy } from '../src/retry.js';
+import { isConnectFailure } from '../src/internal/http.js';
+import {
+  computeRetryDelay,
+  DEFAULT_RETRY_POLICY,
+  isIdempotentRequest,
+  parseRetryAfter,
+  resolveRetryPolicy,
+  shouldRetryStatus,
+} from '../src/retry.js';
 
 const noJitter = resolveRetryPolicy({ jitter: false });
 
@@ -32,5 +40,37 @@ describe('retry policy helpers', () => {
     expect(computeRetryDelay(noJitter, 0, new Headers({ 'retry-after': 'soon' }))).toBe(500);
     const p = resolveRetryPolicy({ jitter: false, respectRetryAfter: false });
     expect(computeRetryDelay(p, 0, new Headers({ 'retry-after': '3' }))).toBe(500);
+  });
+
+  it('classifies idempotent requests by method or Idempotency-Key header', () => {
+    for (const m of ['GET', 'head', 'OPTIONS', 'PUT', 'DELETE']) expect(isIdempotentRequest(m)).toBe(true);
+    expect(isIdempotentRequest('POST')).toBe(false);
+    expect(isIdempotentRequest('POST', { 'Idempotency-Key': 'k' })).toBe(true);
+    expect(isIdempotentRequest('POST', new Headers({ 'idempotency-key': 'k' }))).toBe(true);
+    expect(isIdempotentRequest('POST', { 'x-other': 'k' })).toBe(false);
+  });
+
+  it('drops 502 for non-idempotent requests only while retryOnStatus is the default', () => {
+    expect([429, 502, 503].map((s) => shouldRetryStatus(DEFAULT_RETRY_POLICY, s, true))).toEqual([true, true, true]);
+    expect([429, 500, 502, 503, 504].map((s) => shouldRetryStatus(DEFAULT_RETRY_POLICY, s, false))).toEqual([
+      true,
+      false,
+      false,
+      true,
+      false,
+    ]);
+    // A policy merged from defaults keeps the default list; an explicit list is used as-is.
+    expect(shouldRetryStatus(resolveRetryPolicy({ maxRetries: 5 }), 502, false)).toBe(false);
+    expect(shouldRetryStatus(resolveRetryPolicy({ retryOnStatus: [429, 502, 503] }), 502, false)).toBe(true);
+  });
+
+  it('recognises connect failures, but not resets after sending', () => {
+    const wrap = (code: string) => new TypeError('fetch failed', { cause: Object.assign(new Error(code), { code }) });
+    expect(isConnectFailure(wrap('ECONNREFUSED'))).toBe(true);
+    expect(isConnectFailure(wrap('ENOTFOUND'))).toBe(true);
+    expect(isConnectFailure(wrap('UND_ERR_CONNECT_TIMEOUT'))).toBe(true);
+    expect(isConnectFailure(wrap('UND_ERR_SOCKET'))).toBe(false);
+    expect(isConnectFailure(wrap('ECONNRESET'))).toBe(false);
+    expect(isConnectFailure(new TypeError('Failed to fetch'))).toBe(false); // browsers: no cause
   });
 });

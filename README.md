@@ -153,7 +153,7 @@ new CalibanClient(options?: CalibanClientOptions)
 | `baseURL` | `$CALIBAN_BASE_URL` or `http://localhost:8080/v1` | Includes `/v1`, like the OpenAI SDK. |
 | `defaultCaliban` | none | Merged into every chat request. |
 | `timeoutMs` | `600_000` | Per attempt. For streams it covers the time until headers arrive. |
-| `retry` | 2 retries on 429, 502, 503 | `RetryOptions`, or `false` to disable. |
+| `retry` | 2 retries on 429 and 503 (GET also on 502) | `RetryOptions`, or `false` to disable. See [Retries](#errors-retries-and-timeouts). |
 | `defaultHeaders` | none | Sent on every request. |
 | `fetch` | `globalThis.fetch` | Custom fetch, for example for proxies or tests. |
 
@@ -172,6 +172,7 @@ Every method takes the same `RequestOptions`:
 | `timeoutMs` | Overrides the client timeout for this call. |
 | `retry` | Merged over the client retry policy; `false` disables retries. |
 | `headers` | Extra headers for this call. |
+| `idempotencyKey` | Sent as the `Idempotency-Key` header, which makes this POST retryable on 502. Not sent unless you set it. |
 | `extraBody` | Extra JSON fields merged into the body (after the typed params, before `caliban`). |
 
 **Models.** Items from `models.list()` carry a `caliban` object (`kind`, `family`, `capabilities`, `trust_tier`). It is absent on the virtual `caliban/auto` entry.
@@ -251,19 +252,37 @@ const { data } = await admin.raw.GET('/api/v1/health');
 
 | Helper | Methods |
 |---|---|
-| `tenants` | `list`, `create`, `get` |
-| `apiKeys` | `list`, `create` |
+| `tenants` | `list` (`{ include_deleted }`), `create`, `get`, `delete` |
+| `apiKeys` | `list` (`{ include_revoked }`), `create`, `revoke` |
 | `providerKeys` | `list`, `create`, `delete` (the server crypto-shreds the secret) |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
-| `datasources` | `list`, `create`, `introspect` |
+| `datasources` | `list`, `create`, `delete`, `introspect` |
 | `ontology` | `get`, `review` |
-| `nodes` | `list`, `create` |
+| `nodes` | `list`, `create`, `delete` |
 | `usage` | `get` |
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
 
-Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body read), `retry`, `headers`, `fetch`. Each helper also takes `{ signal, headers }` as its last argument. Non-2xx responses throw `CalibanAPIError`.
+Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body read), `retry`, `headers`, `fetch`. Each helper also takes `{ signal, headers }` as its last argument. Non-2xx responses throw `CalibanAPIError`. Retries follow the same rules as the data-plane client: GET and DELETE retry on 429, 502 and 503, while POST retries only on 429 and 503 unless you pass an `Idempotency-Key` in `headers`.
+
+**Deleting and revoking.** `tenants.delete(tenantId)`, `apiKeys.revoke(tenantId, keyId)`, `datasources.delete(tenantId, datasourceId)` and `nodes.delete(tenantId, nodeId)` resolve to `undefined` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted throws a `CalibanAPIError` with `status: 404`, so a repeated delete throws too.
+
+```ts
+// Revoke a leaked key, then retire the whole tenant.
+await admin.apiKeys.revoke(tenant.id, keyId);
+await admin.tenants.delete(tenant.id); // revokes keys, wipes BYOK credentials, removes routes,
+                                       // soft-deletes datasources and nodes
+
+// Deleted tenants and revoked keys are hidden unless you ask for them.
+const tombstones = (await admin.tenants.list({ include_deleted: true })).filter((t) => t.status === 'deleted');
+const revoked = (await admin.apiKeys.list(otherTenantId, { include_revoked: true })).filter((k) => k.revoked_at);
+```
+
+- Deletes are permanent. The server keeps the rows for audit, but nothing can be restored, and secrets they held (BYOK credentials, datasource connection settings) are destroyed.
+- A deleted tenant's id cannot be reused, and every tenant-scoped call for it returns 404.
+- A standalone deployment rejects a revoked key on the next request. A split-mode router stops accepting it after its next snapshot poll (`CALIBAN_SNAPSHOT_POLL_SECS`, 10 s by default).
+- Tenants carry `status` (`'active' | 'deleted'`) and `deleted_at`; API keys carry `revoked_at`. These fields are optional, so they are `undefined` when an older server omits them.
 
 ### Open models on-prem
 
@@ -403,10 +422,20 @@ try {
 
 All of them extend `CalibanError`, which is also thrown directly for client-side problems such as a missing API key (`type: 'configuration_error'`) or invalid parameters (`type: 'invalid_request_error'`). `isCalibanError()` works even when two copies of the SDK are loaded (for example ESM and CJS in one process).
 
-**Retries.** By default the client retries twice on 429, 502 and 503. The delay grows exponentially from 500 ms to at most 8 s, with jitter, and the client honours `retry-after-ms` and `retry-after` when they ask for 60 s or less. Configure retries per client or per request with `RetryOptions` (`maxRetries`, `initialDelayMs`, `maxDelayMs`, `backoffMultiplier`, `jitter`, `retryOnStatus`, `retryOnNetworkError`, `respectRetryAfter`), or pass `retry: false`.
+**Retries.** By default the client retries up to twice. The delay grows exponentially from 500 ms to at most 8 s, with jitter, and the client honours `retry-after-ms` and `retry-after` when they ask for 60 s or less. Configure retries per client or per request with `RetryOptions` (`maxRetries`, `initialDelayMs`, `maxDelayMs`, `backoffMultiplier`, `jitter`, `retryOnStatus`, `retryOnNetworkError`, `respectRetryAfter`), or pass `retry: false`.
 
-- Network failures are not retried by default (`retryOnNetworkError: true` turns that on), because a chat completion may already have been billed upstream.
-- A 502 is retried by default, POST requests included. The gateway does not support idempotency keys yet, so if a duplicate upstream call would matter, use `retry: { retryOnStatus: [429, 503] }`.
+What is retried depends on whether the request is safe to repeat:
+
+| Request | Statuses retried | Network failures (with `retryOnNetworkError: true`) |
+|---|---|---|
+| GET, HEAD, OPTIONS, PUT, DELETE | 429, 502, 503 | Any |
+| POST (chat completions, embeddings, rerank, admin creates) | 429, 503 | Only when the connection was never established (refused, DNS failure, connect timeout) |
+| POST with an `Idempotency-Key` header | 429, 502, 503 | Any |
+
+- A POST is never retried on 500, 502 or 504, because the gateway may already have run the request and billed it upstream. The same goes for a reset or timeout after the request was sent. In browsers fetch does not say whether the request was sent, so a failed POST is not retried there.
+- Network failures are not retried by default for any request; `retryOnNetworkError: true` turns that on within the limits above.
+- To make a POST retryable like a GET, pass `idempotencyKey` (or an `Idempotency-Key` header). The SDK never sends one on its own. The gateway does not deduplicate on this key yet, so a retry after a 502 can still run the request twice upstream; use a key only when that is acceptable, and a fresh one per logical request.
+- Setting `retryOnStatus` explicitly applies your list to every request as-is, POSTs included. For example, `retry: { retryOnStatus: [429, 502, 503] }` restores the old behaviour of retrying POSTs on 502.
 - Once a stream has started, nothing is retried.
 
 **Timeouts.** The timeout (default 10 minutes for `CalibanClient`, 60 s for `CalibanAdmin`) applies to each attempt. For streams it only covers the time until headers arrive.

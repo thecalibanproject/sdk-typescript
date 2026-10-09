@@ -51,7 +51,10 @@ export interface CalibanAdminOptions {
   /** Control-plane origin **without** `/api/v1`. Defaults to `CALIBAN_ADMIN_URL` or `http://localhost:8081`. */
   baseUrl?: string;
   fetch?: typeof fetch;
-  /** Retry policy; `false` disables. Default: 2 retries on 429/502/503. */
+  /**
+   * Retry policy; `false` disables. Default: 2 retries on 429/502/503 for GET/DELETE, and on
+   * 429/503 only for POST unless it carries an `Idempotency-Key` header.
+   */
   retry?: RetryOptions | false;
   /** Per-attempt timeout (including body read). Default 60 000 ms. */
   timeoutMs?: number;
@@ -60,7 +63,20 @@ export interface CalibanAdminOptions {
 
 export interface AdminRequestOptions {
   signal?: AbortSignal;
+  /** Per-call headers. An `Idempotency-Key` here makes a POST retryable on 502 (not deduplicated by the server yet). */
   headers?: Record<string, string>;
+}
+
+/** Options for `tenants.list()`: request options plus the list query. */
+export interface TenantListOptions extends AdminRequestOptions {
+  /** Also return deleted tenants (tombstones, `status: 'deleted'`). Default false. */
+  include_deleted?: boolean;
+}
+
+/** Options for `apiKeys.list()`: request options plus the list query. */
+export interface ApiKeyListOptions extends AdminRequestOptions {
+  /** Also return revoked keys (those with `revoked_at` set). Default false. */
+  include_revoked?: boolean;
 }
 
 type ApiResult<D> = { data?: D; error?: unknown; response: Response };
@@ -126,19 +142,47 @@ export class CalibanAdmin {
   }
 
   readonly tenants = {
-    list: (opts?: AdminRequestOptions): Promise<Tenant[]> => unwrap(this.raw.GET('/api/v1/tenants', { ...opts })),
+    /** Active tenants; pass `{ include_deleted: true }` to include tombstones. */
+    list: ({ include_deleted, ...opts }: TenantListOptions = {}): Promise<Tenant[]> =>
+      unwrap(this.raw.GET('/api/v1/tenants', { ...opts, params: { query: { include_deleted } } })),
     create: (body: TenantCreate, opts?: AdminRequestOptions): Promise<Tenant> =>
       unwrap(this.raw.POST('/api/v1/tenants', { ...opts, body })),
+    /** A deleted tenant is a 404. */
     get: (tenantId: string, opts?: AdminRequestOptions): Promise<Tenant> =>
       unwrap(this.raw.GET('/api/v1/tenants/{tenantId}', { ...opts, params: { path: { tenantId } } })),
+    /**
+     * Permanently delete a tenant. In one audited transaction the server turns it into a
+     * tombstone, revokes its API keys, destroys its BYOK credentials, removes its routes and
+     * soft-deletes its datasources and nodes. The id cannot be reused. Throws a 404
+     * `CalibanAPIError` if the tenant is unknown or already deleted.
+     */
+    delete: async (tenantId: string, opts?: AdminRequestOptions): Promise<void> => {
+      await unwrap(this.raw.DELETE('/api/v1/tenants/{tenantId}', { ...opts, params: { path: { tenantId } } }));
+    },
   };
 
   readonly apiKeys = {
-    list: (tenantId: string, opts?: AdminRequestOptions): Promise<ApiKeyInfo[]> =>
-      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/api-keys', { ...opts, params: { path: { tenantId } } })),
+    /** Active keys; pass `{ include_revoked: true }` to include revoked ones. */
+    list: (tenantId: string, { include_revoked, ...opts }: ApiKeyListOptions = {}): Promise<ApiKeyInfo[]> =>
+      unwrap(
+        this.raw.GET('/api/v1/tenants/{tenantId}/api-keys', {
+          ...opts,
+          params: { path: { tenantId }, query: { include_revoked } },
+        }),
+      ),
     /** Mint a key. `key` (plaintext) is returned exactly once: store it now. */
     create: (tenantId: string, body: { name?: string } = {}, opts?: AdminRequestOptions): Promise<ApiKeyCreated> =>
       unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/api-keys', { ...opts, params: { path: { tenantId } }, body })),
+    /**
+     * Revoke a key (permanent). A standalone deployment rejects it on the next request; a
+     * split-mode router rejects it after its next snapshot poll (10 s by default). Throws a 404
+     * `CalibanAPIError` if the key is unknown, belongs to another tenant or is already revoked.
+     */
+    revoke: async (tenantId: string, keyId: string, opts?: AdminRequestOptions): Promise<void> => {
+      await unwrap(
+        this.raw.DELETE('/api/v1/tenants/{tenantId}/api-keys/{keyId}', { ...opts, params: { path: { tenantId, keyId } } }),
+      );
+    },
   };
 
   readonly providerKeys = {
@@ -208,6 +252,19 @@ export class CalibanAdmin {
       unwrap(this.raw.GET('/api/v1/datasources', { ...opts, params: { query } })),
     create: (body: DatasourceCreate, opts?: AdminRequestOptions): Promise<Datasource> =>
       unwrap(this.raw.POST('/api/v1/datasources', { ...opts, body })),
+    /**
+     * Permanently delete a datasource of `tenantId`; its stored connection settings are wiped and
+     * its name can be used again. Throws a 404 `CalibanAPIError` if it is unknown, belongs to
+     * another tenant or is already deleted.
+     */
+    delete: async (tenantId: string, datasourceId: string, opts?: AdminRequestOptions): Promise<void> => {
+      await unwrap(
+        this.raw.DELETE('/api/v1/tenants/{tenantId}/datasources/{datasourceId}', {
+          ...opts,
+          params: { path: { tenantId, datasourceId } },
+        }),
+      );
+    },
     /** Start an introspect/profile job that proposes ontology elements. Returns the job id. */
     introspect: (datasourceId: string, opts?: AdminRequestOptions): Promise<{ job_id?: string }> =>
       unwrap(
@@ -236,6 +293,15 @@ export class CalibanAdmin {
           body: { ...body, spec: body.spec as unknown as Schemas['NodeCreate']['spec'] },
         }),
       ),
+    /**
+     * Permanently delete one node version of `tenantId`; its version number is not reused.
+     * Throws a 404 `CalibanAPIError` if it is unknown, belongs to another tenant or is already deleted.
+     */
+    delete: async (tenantId: string, nodeId: string, opts?: AdminRequestOptions): Promise<void> => {
+      await unwrap(
+        this.raw.DELETE('/api/v1/tenants/{tenantId}/nodes/{nodeId}', { ...opts, params: { path: { tenantId, nodeId } } }),
+      );
+    },
   };
 
   readonly usage = {
