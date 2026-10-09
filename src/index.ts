@@ -41,9 +41,13 @@ export { SSEDecoder, iterSSEEvents, iterJSONChunks, DONE_SENTINEL } from './sse.
 export type { ServerSentEvent } from './sse.js';
 export {
   parseResponseMeta,
+  parseCacheTier,
+  parseIntentHeader,
   HEADER_REQUEST_ID,
   HEADER_ROUTED_MODEL,
   HEADER_CACHE,
+  HEADER_CACHE_TIER,
+  HEADER_INTENT,
   HEADER_PII_ENTITIES,
   HEADER_COST_USD,
 } from './meta.js';

@@ -35,7 +35,12 @@ export interface paths {
                     headers: {
                         "x-caliban-request-id"?: string;
                         "x-caliban-routed-model"?: string;
+                        /** @description Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model. */
+                        "x-caliban-intent"?: string;
+                        /** @description `hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request. */
                         "x-caliban-cache"?: "hit" | "miss" | "bypass";
+                        /** @description Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters. */
+                        "x-caliban-cache-tier"?: "exact" | "semantic";
                         "x-caliban-pii-entities"?: number;
                         /** @description Cost of this request in USD (non-streaming only; absent when the model has no price). */
                         "x-caliban-cost-usd"?: string;
@@ -103,7 +108,12 @@ export interface paths {
                         "request-id"?: string;
                         "x-caliban-request-id"?: string;
                         "x-caliban-routed-model"?: string;
+                        /** @description Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model. */
+                        "x-caliban-intent"?: string;
+                        /** @description `hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request. */
                         "x-caliban-cache"?: "hit" | "miss" | "bypass";
+                        /** @description Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters. */
+                        "x-caliban-cache-tier"?: "exact" | "semantic";
                         "x-caliban-pii-entities"?: number;
                         "x-caliban-cost-usd"?: string;
                         [name: string]: unknown;
@@ -527,7 +537,42 @@ export interface paths {
         };
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Change a tenant's PII and cache settings
+         * @description Absent fields keep their value; other fields are rejected. Audited as `tenant.update`
+         *     (old and new values). Routers apply the change with their next snapshot.
+         *     `pii_surrogate_scope: session` opts the tenant out of per-tenant surrogates: every request
+         *     gets fresh surrogates (unlinkable), and requests carrying PII bypass the exact and semantic
+         *     caches. `semantic_cache: on` lets the tenant's eligible requests use the semantic cache
+         *     (also needs `[cache.semantic] enabled`).
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["TenantUpdate"];
+                };
+            };
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Tenant"];
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
         trace?: never;
     };
     "/api/v1/tenants/{tenantId}/api-keys": {
@@ -1636,6 +1681,7 @@ export interface components {
              */
             pii?: "off" | "mask" | "reversible";
             /**
+             * @description `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache when the tenant has it on, whatever the temperature (without it, the semantic cache applies only up to `[cache.semantic] max_temperature`). Unset: exact, plus semantic within the temperature limit when the tenant has it on.
              * @default exact
              * @enum {string}
              */
@@ -1777,6 +1823,18 @@ export interface components {
             region?: string | null;
             /** @enum {string} */
             pii_default?: "off" | "mask" | "reversible";
+            /**
+             * @description T2 semantic cache for this tenant. `on`: eligible requests may be answered with the response to an earlier, semantically similar request of the same tenant (per-entry learned thresholds, deployment error budget). Entries never cross tenants. Also needs `[cache.semantic] enabled`.
+             * @default off
+             * @enum {string}
+             */
+            semantic_cache?: "off" | "on";
+            /**
+             * @description Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.
+             * @default tenant
+             * @enum {string}
+             */
+            pii_surrogate_scope?: "tenant" | "session";
             /** Format: date-time */
             created_at: string;
             /**
@@ -1795,6 +1853,24 @@ export interface components {
              * @enum {string}
              */
             pii_default?: "off" | "mask" | "reversible";
+            /**
+             * @default tenant
+             * @enum {string}
+             */
+            pii_surrogate_scope?: "tenant" | "session";
+            /**
+             * @default off
+             * @enum {string}
+             */
+            semantic_cache?: "off" | "on";
+        };
+        TenantUpdate: {
+            /** @enum {string} */
+            pii_default?: "off" | "mask" | "reversible";
+            /** @enum {string} */
+            pii_surrogate_scope?: "tenant" | "session";
+            /** @enum {string} */
+            semantic_cache?: "off" | "on";
         };
         ApiKeyInfo: {
             id: string;
@@ -1993,16 +2069,34 @@ export interface components {
             prompt_tokens: number;
             completion_tokens: number;
             cached_prompt_tokens?: number;
-            /** @description Tokens not sent upstream thanks to Caliban (e.g. cache hits) */
+            /** @description Tokens not sent upstream thanks to Caliban: on a cache hit of either tier, the cached answer's prompt plus completion tokens */
             tokens_saved?: number;
             intent?: string;
             /** @enum {string} */
             cache: "hit" | "miss" | "bypass";
+            /**
+             * @description Only on hits: which cache tier answered.
+             * @enum {string}
+             */
+            cache_tier?: "exact" | "semantic";
             pii_entities?: number;
             cost_usd?: number | null;
             latency_ms: number;
             /** Format: date-time */
             ts: string;
+            /** @description Model the client asked for (`caliban/auto` or a pinned id). Chat requests only; absent otherwise. */
+            requested_model?: string;
+            /** @description Confidence of the intent decision, 0..1. Chat requests only. */
+            intent_confidence?: number;
+            /**
+             * @description Stage that decided the intent. Chat requests only.
+             * @enum {string}
+             */
+            route_stage?: "rules" | "knn" | "keyword";
+            /** @description `caliban/auto` only: real cost of the routed model for this request (its prices times reported usage). Absent when the model has no price. */
+            routed_model_cost_usd?: number;
+            /** @description `caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`). Margin = flat_price_usd - routed_model_cost_usd. 0 on a cache hit of either tier (no tokens consumed; whether hits should charge the flat price for `tokens_saved` is an open pricing decision). */
+            flat_price_usd?: number;
         };
         UsageReport: {
             events: components["schemas"]["UsageEvent"][];
@@ -2010,9 +2104,19 @@ export interface components {
                 requests?: number;
                 prompt_tokens?: number;
                 completion_tokens?: number;
+                /** @description Hits of both tiers. */
                 cache_hits?: number;
+                semantic_cache_hits?: number;
                 tokens_saved?: number;
                 cost_usd?: number;
+                /** @description Requests that asked for `caliban/auto` */
+                auto_requests?: number;
+                /** @description Sum over `caliban/auto` events that carry both prices */
+                flat_price_usd?: number;
+                /** @description Sum over the same events */
+                routed_model_cost_usd?: number;
+                /** @description flat_price_usd - routed_model_cost_usd */
+                margin_usd?: number;
             };
         };
         Route: {

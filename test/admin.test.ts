@@ -198,6 +198,115 @@ describe('CalibanAdmin', () => {
     expect(m.calls[0]!.url).toBe('http://cp:8081/api/v1/tenants?include_deleted=false');
   });
 
+  it('updates tenant settings with PATCH and returns the tenant', async () => {
+    const updated = { ...tenant, pii_surrogate_scope: 'session', semantic_cache: 'on' };
+    const m = mockFetch(json(updated), json(updated));
+    const a = admin(m.fetch);
+    const t = await a.tenants.update('t_1', { pii_surrogate_scope: 'session', semantic_cache: 'on' });
+    expect(m.calls[0]).toMatchObject({ method: 'PATCH', url: 'http://cp:8081/api/v1/tenants/t_1' });
+    expect(m.calls[0]!.headers.get('authorization')).toBe('Bearer adm_secret');
+    expect(m.calls[0]!.headers.get('content-type')).toContain('application/json');
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ pii_surrogate_scope: 'session', semantic_cache: 'on' });
+    expect(t.pii_surrogate_scope).toBe('session');
+    expect(t.semantic_cache).toBe('on');
+    // Only the given fields are sent; the path id is escaped.
+    await a.tenants.update('t/1', { pii_default: 'mask' });
+    expect(m.calls[1]!.url).toBe('http://cp:8081/api/v1/tenants/t%2F1');
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ pii_default: 'mask' });
+  });
+
+  it('PATCH throws a not-found CalibanAPIError on 404', async () => {
+    const m = mockFetch(json({ error: { message: 'no such tenant', type: 'not_found', code: null } }, { status: 404 }));
+    await expect(admin(m.fetch).tenants.update('gone', { semantic_cache: 'on' })).rejects.toMatchObject({
+      status: 404,
+      type: 'not_found',
+    });
+    expect(m.calls).toHaveLength(1);
+  });
+
+  it('retries PATCH on 503 but not on 502 (non-idempotent by default)', async () => {
+    const retried = mockFetch(new Response('', { status: 503 }), json(tenant));
+    await admin(retried.fetch).tenants.update('t_1', { semantic_cache: 'off' });
+    expect(retried.calls.map((c) => c.method)).toEqual(['PATCH', 'PATCH']);
+    expect(retried.calls[1]!.body).toBe(retried.calls[0]!.body);
+    const bad = mockFetch(json({ error: { message: 'u', type: 'upstream_error' } }, { status: 502 }), json(tenant));
+    await expect(admin(bad.fetch).tenants.update('t_1', { semantic_cache: 'off' })).rejects.toMatchObject({ status: 502 });
+    expect(bad.calls).toHaveLength(1);
+  });
+
+  it('sends the new tenant settings on create and parses tenants with or without them', async () => {
+    const m = mockFetch(json({ ...tenant, pii_surrogate_scope: 'tenant', semantic_cache: 'off' }, { status: 201 }), json([tenant]));
+    const a = admin(m.fetch);
+    const created = await a.tenants.create({ name: 'Acme', pii_surrogate_scope: 'tenant', semantic_cache: 'off' });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ name: 'Acme', pii_surrogate_scope: 'tenant', semantic_cache: 'off' });
+    expect([created.pii_surrogate_scope, created.semantic_cache]).toEqual(['tenant', 'off']);
+    const [older] = await a.tenants.list();
+    expect(older?.pii_surrogate_scope).toBeUndefined();
+    expect(older?.semantic_cache).toBeUndefined();
+  });
+
+  it('parses usage events with and without the routing, cache-tier and pricing fields, and the new totals', async () => {
+    const base = {
+      request_id: 'r1',
+      tenant_id: 't_1',
+      model: 'local/qwen3-8b',
+      prompt_tokens: 12,
+      completion_tokens: 7,
+      cache: 'miss',
+      latency_ms: 40,
+      ts: '2026-10-09T00:00:00Z',
+    };
+    const auto = {
+      ...base,
+      request_id: 'r2',
+      cache: 'hit',
+      cache_tier: 'semantic',
+      tokens_saved: 19,
+      intent: 'translate',
+      requested_model: 'caliban/auto',
+      intent_confidence: 0.912,
+      route_stage: 'knn',
+      routed_model_cost_usd: 0.000026,
+      flat_price_usd: 0.00026,
+    };
+    const totals = {
+      requests: 2,
+      prompt_tokens: 24,
+      completion_tokens: 14,
+      cache_hits: 1,
+      semantic_cache_hits: 1,
+      tokens_saved: 19,
+      cost_usd: 0.000026,
+      auto_requests: 1,
+      flat_price_usd: 0.00026,
+      routed_model_cost_usd: 0.000026,
+      margin_usd: 0.000234,
+    };
+    const m = mockFetch(json({ events: [base, auto], totals }), json({ events: [base], totals: { requests: 1 } }));
+    const a = admin(m.fetch);
+    const report = await a.usage.get({ tenant_id: 't_1' });
+    const [plain, routed] = report.events;
+    expect(plain).toEqual(base);
+    expect(plain?.cache_tier).toBeUndefined();
+    expect(plain?.route_stage).toBeUndefined();
+    expect(routed).toMatchObject({
+      cache: 'hit',
+      cache_tier: 'semantic',
+      requested_model: 'caliban/auto',
+      intent_confidence: 0.912,
+      route_stage: 'knn',
+      routed_model_cost_usd: 0.000026,
+      flat_price_usd: 0.00026,
+      tokens_saved: 19,
+    });
+    expect(report.totals).toEqual(totals);
+    expect(report.totals.margin_usd).toBeCloseTo(report.totals.flat_price_usd! - report.totals.routed_model_cost_usd!, 12);
+    // An older control plane omits the new totals.
+    const older = await a.usage.get();
+    expect(older.totals.semantic_cache_hits).toBeUndefined();
+    expect(older.totals.margin_usd).toBeUndefined();
+  });
+
   it('requires a token', () => {
     expect(() => new CalibanAdmin({ token: '', fetch: mockFetch().fetch })).toThrow(/Missing admin token/);
   });

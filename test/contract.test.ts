@@ -3,27 +3,35 @@ import type { components, paths } from '../src/generated/schema.js';
 import type {
   ApiKeyInfo,
   ApiKeyListOptions,
+  CacheTier,
   CalibanExtension,
   ChatCompletion,
   ChatCompletionCreateParams,
   CreateEmbeddingResponse,
   EmbeddingCreateParams,
+  IntentDecision,
   ModelCalibanInfo,
   ModelCreate,
   ModelDiscovery,
   ModelInfo,
   ModelList,
+  PiiSurrogateScope,
   ProviderHealth,
   ReasoningEffort,
   RegistryModel,
   RerankCreateParams,
   RerankResponse,
   RerankResult,
+  RouteStage,
+  SemanticCacheSetting,
   SharedProvider,
   SharedProviderCreate,
   Tenant,
   TenantListOptions,
+  TenantUpdate,
   TrustTier,
+  UsageEvent,
+  UsageTotals,
 } from '../src/index.js';
 
 type Schemas = components['schemas'];
@@ -120,6 +128,57 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<RerankHeaders['x-caliban-routed-model']>().toEqualTypeOf<string | undefined>();
 
     for (const f of [reqToContract, reqFromContract, resToContract]) expect(typeof f).toBe('function');
+  });
+
+  it('tenant settings, routing headers and usage fields follow the contract', () => {
+    type ChatHeaders = paths['/v1/chat/completions']['post']['responses'][200]['headers'];
+    type MessagesHeaders = paths['/v1/messages']['post']['responses'][200]['headers'];
+    // PATCH /api/v1/tenants/{tenantId} exists and takes TenantUpdate.
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}']['patch']>().not.toBeNever();
+    expectTypeOf<
+      paths['/api/v1/tenants/{tenantId}']['patch']['requestBody']['content']['application/json']
+    >().toEqualTypeOf<TenantUpdate>();
+    expectTypeOf<KnownKeys<TenantUpdate>>().toEqualTypeOf<'pii_default' | 'pii_surrogate_scope' | 'semantic_cache'>();
+    expectTypeOf<PiiSurrogateScope>().toEqualTypeOf<'tenant' | 'session'>();
+    expectTypeOf<SemanticCacheSetting>().toEqualTypeOf<'off' | 'on'>();
+    expectTypeOf<Tenant['pii_surrogate_scope']>().toEqualTypeOf<PiiSurrogateScope | undefined>();
+    expectTypeOf<Tenant['semantic_cache']>().toEqualTypeOf<SemanticCacheSetting | undefined>();
+    expectTypeOf<Schemas['TenantCreate']['pii_surrogate_scope']>().toEqualTypeOf<PiiSurrogateScope | undefined>();
+    expectTypeOf<Schemas['TenantCreate']['semantic_cache']>().toEqualTypeOf<SemanticCacheSetting | undefined>();
+    // @ts-expect-error TenantUpdate is closed (additionalProperties: false): `name` cannot be patched
+    const badPatch: TenantUpdate = { name: 'x' };
+    expect(badPatch).toBeDefined();
+
+    // Header types the meta parser narrows to.
+    expectTypeOf<CacheTier>().toEqualTypeOf<NonNullable<ChatHeaders['x-caliban-cache-tier']>>();
+    expectTypeOf<CacheTier>().toEqualTypeOf<NonNullable<MessagesHeaders['x-caliban-cache-tier']>>();
+    expectTypeOf<ChatHeaders['x-caliban-intent']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<MessagesHeaders['x-caliban-intent']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<NonNullable<ChatHeaders['x-caliban-cache']>>().toEqualTypeOf<'hit' | 'miss' | 'bypass'>();
+    expectTypeOf<RouteStage>().toEqualTypeOf<NonNullable<UsageEvent['route_stage']>>();
+    expectTypeOf<IntentDecision['stage']>().toEqualTypeOf<RouteStage>();
+
+    // Usage events: the cache enum is unchanged; the new fields are optional.
+    expectTypeOf<UsageEvent['cache']>().toEqualTypeOf<'hit' | 'miss' | 'bypass'>();
+    expectTypeOf<UsageEvent['cache_tier']>().toEqualTypeOf<CacheTier | undefined>();
+    expectTypeOf<UsageEvent['requested_model']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<UsageEvent['intent_confidence']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<UsageEvent['routed_model_cost_usd']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<UsageEvent['flat_price_usd']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<UsageEvent['tokens_saved']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<KnownKeys<UsageTotals>>().toEqualTypeOf<
+      | 'requests'
+      | 'prompt_tokens'
+      | 'completion_tokens'
+      | 'cache_hits'
+      | 'semantic_cache_hits'
+      | 'tokens_saved'
+      | 'cost_usd'
+      | 'auto_requests'
+      | 'flat_price_usd'
+      | 'routed_model_cost_usd'
+      | 'margin_usd'
+    >();
   });
 
   it('rejects a misspelled extension key at compile time', () => {

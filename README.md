@@ -85,7 +85,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | Field | Values | Meaning |
 |---|---|---|
 | `pii` | `off`, `mask`, `reversible` | How PII is handled before text leaves your trust boundary. `mask` replaces entities with placeholders such as `[EMAIL]`; `reversible` pseudonymises them and restores the originals in the response. |
-| `cache` | `off`, `exact`, `semantic` | Response cache mode. |
+| `cache` | `off`, `exact`, `semantic` | Response cache mode. `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache if the tenant has it on, whatever the temperature. Left out: exact, plus semantic up to the gateway's temperature limit if the tenant has it on (see [Tenant settings](#tenant-settings)). |
 | `datasources` | `string[]` | Datasources (by name) the request may query through the ontology layer. |
 | `node` | `string` | Run the request through a named node (agent). |
 | `max_cost_usd` | number, `>= 0` | Cost ceiling for the request. |
@@ -113,11 +113,24 @@ The gateway reports what it did in `x-caliban-*` response headers. The SDK parse
 |---|---|---|
 | `x-caliban-request-id` | `requestId` | Quote it in bug reports. |
 | `x-caliban-routed-model` | `routedModel` | The model the router actually used (useful with `caliban/auto`). |
-| `x-caliban-cache` | `cache` | `hit`, `miss` or `bypass`. |
+| `x-caliban-cache` | `cache` | `hit`, `miss` or `bypass`. `hit` covers both cache tiers. |
+| `x-caliban-cache-tier` | `cacheTier` | `'exact'` or `'semantic'`, sent on hits only. `undefined` otherwise. |
+| `x-caliban-intent` | `intent` | The routing decision, parsed into `{ intent, confidence, stage, knnReason? }`. `undefined` when absent or malformed. |
 | `x-caliban-pii-entities` | `piiEntities` | Number of PII entities detected and protected. |
 | `x-caliban-cost-usd` | `costUsd` | Non-streaming responses only; `null` when the model has no price. |
 
-`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`), and `parseResponseMeta(response)` works on any `Response`.
+`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_CACHE_TIER`, `HEADER_INTENT`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`), and `parseResponseMeta(response)` works on any `Response`.
+
+The gateway sends `x-caliban-intent` as `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` when kNN routing was on but did not decide (`timeout`, `embed_error`, `unavailable`, `no_text`, `abstain_oos`, `abstain_confidence`, `abstain_margin`, `abstain_empty`). A request for a named model reports `pinned;confidence=1.000;stage=rules`.
+
+```ts
+const res = await caliban.chat.completions.create({ model: 'caliban/auto', messages });
+if (res.meta.cache === 'hit') console.log('served from the', res.meta.cacheTier, 'cache');
+const route = res.meta.intent; // { intent: 'translate', confidence: 0.912, stage: 'knn' }
+if (route?.knnReason) console.warn('kNN fell back to', route.stage, 'because of', route.knnReason);
+```
+
+Parsing never throws. Unknown `key=value` fields are ignored, so a newer gateway can add fields. A value with no intent name, a missing or out-of-range `confidence`, or a missing or unknown `stage` gives `intent: undefined`; an unknown cache tier gives `cacheTier: undefined`. `parseIntentHeader(value)` and `parseCacheTier(value)` are exported for raw header strings.
 
 ### Reasoning models
 
@@ -252,7 +265,7 @@ const { data } = await admin.raw.GET('/api/v1/health');
 
 | Helper | Methods |
 |---|---|
-| `tenants` | `list` (`{ include_deleted }`), `create`, `get`, `delete` |
+| `tenants` | `list` (`{ include_deleted }`), `create`, `get`, `update`, `delete` |
 | `apiKeys` | `list` (`{ include_revoked }`), `create`, `revoke` |
 | `providerKeys` | `list`, `create`, `delete` (the server crypto-shreds the secret) |
 | `models` | `list`, `create`, `delete` |
@@ -264,7 +277,51 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
 
-Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body read), `retry`, `headers`, `fetch`. Each helper also takes `{ signal, headers }` as its last argument. Non-2xx responses throw `CalibanAPIError`. Retries follow the same rules as the data-plane client: GET and DELETE retry on 429, 502 and 503, while POST retries only on 429 and 503 unless you pass an `Idempotency-Key` in `headers`.
+Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body read), `retry`, `headers`, `fetch`. Each helper also takes `{ signal, headers }` as its last argument. Non-2xx responses throw `CalibanAPIError`. Retries follow the same rules as the data-plane client: GET and DELETE retry on 429, 502 and 503, while POST and PATCH retry only on 429 and 503 unless you pass an `Idempotency-Key` in `headers`.
+
+#### Tenant settings
+
+`tenants.update(tenantId, patch)` sends `PATCH /api/v1/tenants/{tenantId}` and resolves to the updated tenant. Fields you leave out keep their value; any other field is a compile error (`TenantUpdate` is closed). The change is audited as `tenant.update`, and split-mode routers apply it with their next snapshot. An unknown or deleted tenant throws a `CalibanAPIError` with `status: 404`. The same fields can be set on `tenants.create()`.
+
+| Field | Values | Default | Meaning |
+|---|---|---|---|
+| `pii_default` | `off`, `mask`, `reversible` | `reversible` | PII mode for requests that do not set `caliban.pii`. |
+| `pii_surrogate_scope` | `tenant`, `session` | `tenant` | How reversible PII surrogates are chosen. |
+| `semantic_cache` | `off`, `on` | `off` | Whether the tenant's eligible requests may use the semantic cache. |
+
+```ts
+await admin.tenants.update(tenant.id, { semantic_cache: 'on' });
+const t = await admin.tenants.update(tenant.id, { pii_surrogate_scope: 'session' });
+console.log(t.pii_surrogate_scope, t.semantic_cache); // 'session' 'on'
+```
+
+- **`pii_surrogate_scope: 'tenant'`** (the default): a given value always gets the same surrogate within the tenant (a keyed HMAC per tenant, derived from `CALIBAN_KEK`). That lets pseudonymised requests hit the exact cache. The trade-off is linkability: anyone who can see the pseudonymised traffic (an upstream provider, for example) can tell that two requests or sessions of the tenant mention the same person, even without learning who it is. Surrogates never cross tenants.
+- **`pii_surrogate_scope: 'session'`**: every request gets fresh surrogates, so requests cannot be linked through them. Requests that carry PII then bypass the exact and semantic caches.
+- **`semantic_cache: 'on'`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
+
+Tenants from an older server omit both fields, so they are `undefined`.
+
+#### Usage fields
+
+`usage.get()` returns `{ events, totals }` (`UsageEvent[]` and `UsageTotals`). Beyond the request basics (`model`, tokens, `cache`, `cost_usd`, `latency_ms`, `ts`), an event can carry these optional fields. They are omitted, never `null`, when they do not apply, and they are all absent on events from an older server.
+
+| Field | When present | Meaning |
+|---|---|---|
+| `cache_tier` | Cache hits | `'exact'` or `'semantic'`. `cache` stays `hit`, `miss` or `bypass`. |
+| `tokens_saved` | Cache hits | Tokens not sent upstream: the cached answer's prompt plus completion tokens. |
+| `requested_model` | Chat requests | The model the client asked for: `caliban/auto` or a pinned id. |
+| `intent_confidence` | Chat requests | Confidence of the intent decision, 0..1. |
+| `route_stage` | Chat requests | `'rules'`, `'knn'` or `'keyword'`. |
+| `routed_model_cost_usd` | `caliban/auto`, priced model | Real cost of the routed model for this request. |
+| `flat_price_usd` | `caliban/auto` | The flat auto price for the same tokens. `0` on a cache hit. |
+
+`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `auto_requests` (requests for `caliban/auto`), and `flat_price_usd`, `routed_model_cost_usd` and `margin_usd` (`flat_price_usd - routed_model_cost_usd`), summed over the `caliban/auto` events that carry both prices.
+
+```ts
+const { totals } = await admin.usage.get({ tenant_id: tenant.id });
+console.log(`${totals.semantic_cache_hits ?? 0} of ${totals.cache_hits ?? 0} hits were semantic`);
+console.log(`auto margin: $${(totals.margin_usd ?? 0).toFixed(4)} over ${totals.auto_requests ?? 0} requests`);
+```
 
 **Deleting and revoking.** `tenants.delete(tenantId)`, `apiKeys.revoke(tenantId, keyId)`, `datasources.delete(tenantId, datasourceId)` and `nodes.delete(tenantId, nodeId)` resolve to `undefined` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted throws a `CalibanAPIError` with `status: 404`, so a repeated delete throws too.
 
@@ -429,7 +486,7 @@ What is retried depends on whether the request is safe to repeat:
 | Request | Statuses retried | Network failures (with `retryOnNetworkError: true`) |
 |---|---|---|
 | GET, HEAD, OPTIONS, PUT, DELETE | 429, 502, 503 | Any |
-| POST (chat completions, embeddings, rerank, admin creates) | 429, 503 | Only when the connection was never established (refused, DNS failure, connect timeout) |
+| POST (chat completions, embeddings, rerank, admin creates) and PATCH (`tenants.update`) | 429, 503 | Only when the connection was never established (refused, DNS failure, connect timeout) |
 | POST with an `Idempotency-Key` header | 429, 502, 503 | Any |
 
 - A POST is never retried on 500, 502 or 504, because the gateway may already have run the request and billed it upstream. The same goes for a reset or timeout after the request was sent. In browsers fetch does not say whether the request was sent, so a failed POST is not retried there.

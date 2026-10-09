@@ -9,6 +9,12 @@ import { resolveRetryPolicy, type RetryOptions } from './retry.js';
 type Schemas = components['schemas'];
 export type Tenant = Schemas['Tenant'];
 export type TenantCreate = Schemas['TenantCreate'];
+/** Body for `tenants.update()` (contract: `TenantUpdate`). Absent fields keep their value. */
+export type TenantUpdate = Schemas['TenantUpdate'];
+/** `pii_surrogate_scope`: `tenant` (default, linkable within the tenant) or `session` (fresh per request). */
+export type PiiSurrogateScope = NonNullable<Tenant['pii_surrogate_scope']>;
+/** `semantic_cache` tenant setting: `off` (default) or `on`. */
+export type SemanticCacheSetting = NonNullable<Tenant['semantic_cache']>;
 export type ApiKeyInfo = Schemas['ApiKeyInfo'];
 export type ApiKeyCreated = Schemas['ApiKeyCreated'];
 export type ProviderKind = Schemas['ProviderKind'];
@@ -39,6 +45,8 @@ export type OntologyReview = NonNullable<
 export type Node = Schemas['Node'];
 export type UsageReport = Schemas['UsageReport'];
 export type UsageEvent = Schemas['UsageEvent'];
+/** `UsageReport.totals`. */
+export type UsageTotals = UsageReport['totals'];
 export type Health = Schemas['Health'];
 /** `NodeCreate` with `spec` typed against node.schema.json instead of a free-form object. */
 export type NodeCreate = Omit<Schemas['NodeCreate'], 'spec'> & { spec: NodeSpec };
@@ -150,6 +158,13 @@ export class CalibanAdmin {
     /** A deleted tenant is a 404. */
     get: (tenantId: string, opts?: AdminRequestOptions): Promise<Tenant> =>
       unwrap(this.raw.GET('/api/v1/tenants/{tenantId}', { ...opts, params: { path: { tenantId } } })),
+    /**
+     * Change a tenant's PII and cache settings (`PATCH`). Fields left out keep their value.
+     * Audited as `tenant.update`; routers apply the change with their next snapshot. Retried on
+     * 429/503 only (like a POST), unless the request carries an `Idempotency-Key` header.
+     */
+    update: (tenantId: string, patch: TenantUpdate, opts?: AdminRequestOptions): Promise<Tenant> =>
+      unwrap(this.raw.PATCH('/api/v1/tenants/{tenantId}', { ...opts, params: { path: { tenantId } }, body: patch })),
     /**
      * Permanently delete a tenant. In one audited transaction the server turns it into a
      * tombstone, revokes its API keys, destroys its BYOK credentials, removes its routes and

@@ -221,6 +221,27 @@ export interface ChatCompletionChunk {
 /** `x-caliban-cache` values; open-ended for forward compatibility. */
 export type CacheStatus = 'hit' | 'miss' | 'bypass' | (string & {});
 
+/** `x-caliban-cache-tier`: which cache tier answered a hit (`x-caliban-cache` stays `hit` for both). */
+export type CacheTier = 'exact' | 'semantic';
+
+/** Routing stage that decided the intent: `rules` (pinned model), `knn` or `keyword`. */
+export type RouteStage = 'rules' | 'knn' | 'keyword';
+
+/** The routing decision parsed from `x-caliban-intent`. */
+export interface IntentDecision {
+  /** Intent name, e.g. `translate`; `pinned` when the client named a model. */
+  intent: string;
+  /** Confidence of the decision, 0..1. */
+  confidence: number;
+  stage: RouteStage;
+  /**
+   * Why kNN did not decide although it was on (`timeout`, `embed_error`, `unavailable`,
+   * `no_text`, `abstain_oos`, `abstain_confidence`, `abstain_margin`, `abstain_empty`, or a
+   * newer reason). Absent when kNN decided or was off.
+   */
+  knnReason?: string;
+}
+
 /** Caliban metadata parsed from data-plane response headers. */
 export interface CalibanResponseMeta {
   /** `x-caliban-request-id` */
@@ -229,6 +250,16 @@ export interface CalibanResponseMeta {
   routedModel: string | null;
   /** `x-caliban-cache`: `hit | miss | bypass` */
   cache: CacheStatus | null;
+  /**
+   * `x-caliban-cache-tier`: `exact` or `semantic`, sent on hits only. `undefined` when absent or
+   * not one of those values.
+   */
+  cacheTier?: CacheTier;
+  /**
+   * `x-caliban-intent`, parsed. `undefined` when absent or malformed (no intent name, missing or
+   * out-of-range `confidence`, missing or unknown `stage`). Unknown `key=value` fields are ignored.
+   */
+  intent?: IntentDecision;
   /** `x-caliban-pii-entities`: number of PII entities detected/redacted. */
   piiEntities: number | null;
   /**
