@@ -288,6 +288,7 @@ Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body r
 | `pii_default` | `off`, `mask`, `reversible` | `reversible` | PII mode for requests that do not set `caliban.pii`. |
 | `pii_surrogate_scope` | `tenant`, `session` | `tenant` | How reversible PII surrogates are chosen. |
 | `semantic_cache` | `off`, `on` | `off` | Whether the tenant's eligible requests may use the semantic cache. |
+| `auto_cache_hit_fraction` | `0` to `1`, or `null` | `null` | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `null` uses the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured); sending `null` clears an override. |
 
 ```ts
 await admin.tenants.update(tenant.id, { semantic_cache: 'on' });
@@ -297,6 +298,7 @@ console.log(t.pii_surrogate_scope, t.semantic_cache); // 'session' 'on'
 
 - **`pii_surrogate_scope: 'tenant'`** (the default): a given value always gets the same surrogate within the tenant (a keyed HMAC per tenant, derived from `CALIBAN_KEK`). That lets pseudonymised requests hit the exact cache. The trade-off is linkability: anyone who can see the pseudonymised traffic (an upstream provider, for example) can tell that two requests or sessions of the tenant mention the same person, even without learning who it is. Surrogates never cross tenants.
 - **`pii_surrogate_scope: 'session'`**: every request gets fresh surrogates, so requests cannot be linked through them. Requests that carry PII then bypass the exact and semantic caches.
+- **`auto_cache_hit_fraction`**: a cache hit (exact or semantic) calls no model, so a `caliban/auto` request answered from cache is billed this share of the flat price. Out of range is a `422`.
 - **`semantic_cache: 'on'`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
 
 Tenants from an older server omit both fields, so they are `undefined`.
@@ -313,14 +315,17 @@ Tenants from an older server omit both fields, so they are `undefined`.
 | `intent_confidence` | Chat requests | Confidence of the intent decision, 0..1. |
 | `route_stage` | Chat requests | `'rules'`, `'knn'` or `'keyword'`. |
 | `routed_model_cost_usd` | `caliban/auto`, priced model | Real cost of the routed model for this request. |
-| `flat_price_usd` | `caliban/auto` | The flat auto price for the same tokens. `0` on a cache hit. |
+| `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
+| `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` x the tenant's cache-hit fraction on a hit. |
+| `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
 
-`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `auto_requests` (requests for `caliban/auto`), and `flat_price_usd`, `routed_model_cost_usd` and `margin_usd` (`flat_price_usd - routed_model_cost_usd`), summed over the `caliban/auto` events that carry both prices.
+`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
 ```ts
 const { totals } = await admin.usage.get({ tenant_id: tenant.id });
 console.log(`${totals.semantic_cache_hits ?? 0} of ${totals.cache_hits ?? 0} hits were semantic`);
 console.log(`auto margin: $${(totals.margin_usd ?? 0).toFixed(4)} over ${totals.auto_requests ?? 0} requests`);
+console.log(`${totals.auto_cache_hits ?? 0} auto cache hits saved customers $${(totals.auto_saved_usd ?? 0).toFixed(4)}`);
 ```
 
 **Deleting and revoking.** `tenants.delete(tenantId)`, `apiKeys.revoke(tenantId, keyId)`, `datasources.delete(tenantId, datasourceId)` and `nodes.delete(tenantId, nodeId)` resolve to `undefined` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted throws a `CalibanAPIError` with `status: 404`, so a repeated delete throws too.

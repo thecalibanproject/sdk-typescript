@@ -138,7 +138,13 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<
       paths['/api/v1/tenants/{tenantId}']['patch']['requestBody']['content']['application/json']
     >().toEqualTypeOf<TenantUpdate>();
-    expectTypeOf<KnownKeys<TenantUpdate>>().toEqualTypeOf<'pii_default' | 'pii_surrogate_scope' | 'semantic_cache'>();
+    expectTypeOf<KnownKeys<TenantUpdate>>().toEqualTypeOf<
+      'pii_default' | 'pii_surrogate_scope' | 'semantic_cache' | 'auto_cache_hit_fraction'
+    >();
+    // Cache-hit billing: a fraction in 0..1, `null` = the deployment value (and clears it on PATCH).
+    expectTypeOf<TenantUpdate['auto_cache_hit_fraction']>().toEqualTypeOf<number | null | undefined>();
+    expectTypeOf<Tenant['auto_cache_hit_fraction']>().toEqualTypeOf<number | null | undefined>();
+    expectTypeOf<Schemas['TenantCreate']['auto_cache_hit_fraction']>().toEqualTypeOf<number | null | undefined>();
     expectTypeOf<PiiSurrogateScope>().toEqualTypeOf<'tenant' | 'session'>();
     expectTypeOf<SemanticCacheSetting>().toEqualTypeOf<'off' | 'on'>();
     expectTypeOf<Tenant['pii_surrogate_scope']>().toEqualTypeOf<PiiSurrogateScope | undefined>();
@@ -166,16 +172,25 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<UsageEvent['routed_model_cost_usd']>().toEqualTypeOf<number | undefined>();
     expectTypeOf<UsageEvent['flat_price_usd']>().toEqualTypeOf<number | undefined>();
     expectTypeOf<UsageEvent['tokens_saved']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<UsageEvent['billed_usd']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<UsageEvent['saved_usd']>().toEqualTypeOf<number | undefined>();
     expectTypeOf<KnownKeys<UsageTotals>>().toEqualTypeOf<
       | 'requests'
       | 'prompt_tokens'
       | 'completion_tokens'
+      | 'cached_prompt_tokens'
+      | 'cache_write_tokens'
+      | 'estimated_requests'
       | 'cache_hits'
+      | 'saved_usd'
       | 'semantic_cache_hits'
       | 'tokens_saved'
       | 'cost_usd'
       | 'auto_requests'
+      | 'auto_cache_hits'
       | 'flat_price_usd'
+      | 'billed_usd'
+      | 'auto_saved_usd'
       | 'routed_model_cost_usd'
       | 'margin_usd'
     >();

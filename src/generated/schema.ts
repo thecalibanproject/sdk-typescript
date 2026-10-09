@@ -56,6 +56,7 @@ export interface paths {
                 403: components["responses"]["Error"];
                 429: components["responses"]["RateLimited"];
                 502: components["responses"]["Error"];
+                503: components["responses"]["Overloaded"];
             };
         };
         delete?: never;
@@ -128,6 +129,7 @@ export interface paths {
                 403: components["responses"]["AnthropicError"];
                 429: components["responses"]["AnthropicRateLimited"];
                 502: components["responses"]["AnthropicError"];
+                503: components["responses"]["AnthropicOverloaded"];
             };
         };
         delete?: never;
@@ -508,7 +510,7 @@ export interface paths {
          * Delete a tenant (tombstone)
          * @description In one audited transaction (`tenant.delete`): the tenant becomes a tombstone
          *     (`status: deleted`, `deleted_at` set), all its API keys are revoked, its BYOK provider
-         *     credentials are destroyed (sealed ciphertext removed), its routes are removed, and its
+         *     credentials and its data key (DEK) are destroyed (crypto-shredding), its routes are removed, and its
          *     datasources (connection settings wiped) and nodes are soft-deleted. The tenant leaves the
          *     data-plane snapshot, so routers reject its keys from their next snapshot. Audit rows are
          *     kept. The tenant id cannot be reused (`POST /api/v1/tenants` with the same name is a 409).
@@ -538,13 +540,16 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Change a tenant's PII and cache settings
+         * Change a tenant's PII, cache and cache-hit billing settings
          * @description Absent fields keep their value; other fields are rejected. Audited as `tenant.update`
          *     (old and new values). Routers apply the change with their next snapshot.
          *     `pii_surrogate_scope: session` opts the tenant out of per-tenant surrogates: every request
          *     gets fresh surrogates (unlinkable), and requests carrying PII bypass the exact and semantic
          *     caches. `semantic_cache: on` lets the tenant's eligible requests use the semantic cache
-         *     (also needs `[cache.semantic] enabled`).
+         *     (also needs `[cache.semantic] enabled`). `auto_cache_hit_fraction` sets the share of the
+         *     flat `caliban/auto` price billed for this tenant's cache hits (0 to 1); `null` clears it, so
+         *     the deployment's `[routing] auto_cache_hit_fraction` (default 0.2) applies. Out of range
+         *     is a 422.
          */
         patch: {
             parameters: {
@@ -1835,6 +1840,8 @@ export interface components {
              * @enum {string}
              */
             pii_surrogate_scope?: "tenant" | "session";
+            /** @description Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant's request: no model is called. `null`: the deployment's `[routing] auto_cache_hit_fraction` (default 0.2) applies. */
+            auto_cache_hit_fraction?: number | null;
             /** Format: date-time */
             created_at: string;
             /**
@@ -1863,6 +1870,8 @@ export interface components {
              * @enum {string}
              */
             semantic_cache?: "off" | "on";
+            /** @description Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value. */
+            auto_cache_hit_fraction?: number | null;
         };
         TenantUpdate: {
             /** @enum {string} */
@@ -1871,6 +1880,8 @@ export interface components {
             pii_surrogate_scope?: "tenant" | "session";
             /** @enum {string} */
             semantic_cache?: "off" | "on";
+            /** @description A number sets the override; `null` clears it (the deployment value applies); absent keeps it. */
+            auto_cache_hit_fraction?: number | null;
         };
         ApiKeyInfo: {
             id: string;
@@ -1914,7 +1925,7 @@ export interface components {
             /** @description Provider id referenced by the model catalogue (e.g. local-llm, openai). Defaults to the slugified label. */
             provider_id?: string;
             base_url?: string;
-            /** @description Write-only. Sealed under CALIBAN_KEK. Optional for keyless local endpoints. */
+            /** @description Write-only. Sealed under the tenant data key (created on the first secret, wrapped by CALIBAN_KEK). Optional for keyless local endpoints. */
             api_key?: string;
             trust_tier: components["schemas"]["TrustTier"];
             /**
@@ -1945,6 +1956,11 @@ export interface components {
              * @default false
              */
             inline_think_tags?: boolean;
+            /**
+             * @description The server rejects `stream_options`. Caliban then does not request usage on streams, and meters them from an estimate (`usage_source: estimated`). Leave false for servers that accept it (vLLM, SGLang, OpenAI).
+             * @default false
+             */
+            rejects_stream_options?: boolean;
         };
         ModelCreate: {
             /** @description Caliban model id, e.g. local/qwen3-8b */
@@ -1961,6 +1977,12 @@ export interface components {
             context_window?: number | null;
             price_in_per_mtok?: number | null;
             price_out_per_mtok?: number | null;
+            /** @description USD per million prompt tokens read from the provider prompt cache (OpenAI `cached_tokens`, Anthropic `cache_read_input_tokens`). Null: `price_in_per_mtok`. */
+            price_cache_read_per_mtok?: number | null;
+            /** @description USD per million prompt tokens written to the provider prompt cache (Anthropic `cache_creation_input_tokens`, 5-minute TTL). Null: `price_in_per_mtok`. */
+            price_cache_write_per_mtok?: number | null;
+            /** @description USD per million tokens written with the Anthropic 1-hour TTL (`cache_creation.ephemeral_1h_input_tokens`). Null: `price_cache_write_per_mtok`. */
+            price_cache_write_1h_per_mtok?: number | null;
         };
         Model: {
             id: string;
@@ -1975,6 +1997,12 @@ export interface components {
             context_window?: number | null;
             price_in_per_mtok?: number | null;
             price_out_per_mtok?: number | null;
+            /** @description USD per million prompt tokens read from the provider prompt cache (OpenAI `cached_tokens`, Anthropic `cache_read_input_tokens`). Null: `price_in_per_mtok`. */
+            price_cache_read_per_mtok?: number | null;
+            /** @description USD per million prompt tokens written to the provider prompt cache (Anthropic `cache_creation_input_tokens`, 5-minute TTL). Null: `price_in_per_mtok`. */
+            price_cache_write_per_mtok?: number | null;
+            /** @description USD per million tokens written with the Anthropic 1-hour TTL (`cache_creation.ephemeral_1h_input_tokens`). Null: `price_cache_write_per_mtok`. */
+            price_cache_write_1h_per_mtok?: number | null;
         };
         SharedProvider: {
             id: string;
@@ -1995,7 +2023,7 @@ export interface components {
             trust_tier: components["schemas"]["TrustTier"];
             /** @default false */
             cache_salt?: boolean;
-            /** @description Write-only; sealed at rest */
+            /** @description Write-only. Sealed under the current CALIBAN_KEK (re-sealed by `caliban keys rotate`). */
             api_key?: string;
             tenants?: string[];
         };
@@ -2010,12 +2038,16 @@ export interface components {
             status: "pending" | "connected" | "error" | "introspecting";
             /** @description Monotonic data version used for cache invalidation */
             epoch?: number;
+            /** @description Redacted connection settings: credentials are shown masked (`****`, or a URI as `scheme://user:****@host`); `{env}`/`{file}` references are shown as they are. Credentials are never returned. */
+            connection?: {
+                [key: string]: unknown;
+            };
         };
         DatasourceCreate: {
             tenant_id: string;
             kind: components["schemas"]["DatasourceKind"];
             name: string;
-            /** @description Kind-specific connection settings. Secrets inside are encrypted at rest. */
+            /** @description Kind-specific connection settings. Credentials (password, api_key, token, client_secret, private_key, credentials and similar fields, URIs with a password, secret query parameters, `Password=...;` pairs) are sealed under the tenant data key before they are stored; `{"env": ...}` and `{"file": ...}` references are kept as references. Keys named `$sealed` or `$redacted` are rejected (400). Storing credentials needs CALIBAN_KEK on the control plane (400 otherwise). */
             connection: {
                 [key: string]: unknown;
             };
@@ -2068,7 +2100,17 @@ export interface components {
             model: string;
             prompt_tokens: number;
             completion_tokens: number;
+            /** @description Part of prompt_tokens read from the provider prompt cache. */
             cached_prompt_tokens?: number;
+            /** @description Part of prompt_tokens written to the provider prompt cache (Anthropic `cache_creation_input_tokens`). Omitted when 0. */
+            cache_write_tokens?: number;
+            /** @description Part of cache_write_tokens written with the Anthropic 1-hour TTL. Omitted when 0. */
+            cache_write_1h_tokens?: number;
+            /**
+             * @description `provider`: the token counts are the provider's usage report. `estimated`: no complete report arrived (the client disconnected mid-stream, the upstream stream failed or ended without usage, or the model has `rejects_stream_options`), so the gateway estimated them: prompt tokens from the provider's partial report when one arrived (Anthropic `message_start`), else from the request; completion tokens from the output streamed so far, about 4 bytes per token. After a disconnect the provider may bill more than the estimate. Absent on cache hits (nothing consumed) and on events written before this field existed.
+             * @enum {string}
+             */
+            usage_source?: "provider" | "estimated";
             /** @description Tokens not sent upstream thanks to Caliban: on a cache hit of either tier, the cached answer's prompt plus completion tokens */
             tokens_saved?: number;
             intent?: string;
@@ -2080,6 +2122,7 @@ export interface components {
              */
             cache_tier?: "exact" | "semantic";
             pii_entities?: number;
+            /** @description Uncached prompt tokens at price_in_per_mtok, cache reads at price_cache_read_per_mtok, cache writes at price_cache_write_per_mtok (1-hour writes at price_cache_write_1h_per_mtok), completion at price_out_per_mtok. Unset cache prices fall back to the input price. Null when the model has no input or output price. */
             cost_usd?: number | null;
             latency_ms: number;
             /** Format: date-time */
@@ -2093,10 +2136,14 @@ export interface components {
              * @enum {string}
              */
             route_stage?: "rules" | "knn" | "keyword";
-            /** @description `caliban/auto` only: real cost of the routed model for this request (its prices times reported usage). Absent when the model has no price. */
+            /** @description `caliban/auto` only: real cost of the routed model for this request (the same number and cost function as `cost_usd`, prompt-cache prices included). Absent when the model has no price. */
             routed_model_cost_usd?: number;
-            /** @description `caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`). Margin = flat_price_usd - routed_model_cost_usd. 0 on a cache hit of either tier (no tokens consumed; whether hits should charge the flat price for `tokens_saved` is an open pricing decision). */
+            /** @description `caliban/auto` only: flat auto price for the same tokens (`[routing] auto_price_*`), through the same cost function as `cost_usd`; the flat price has no cache prices, so cache reads and writes count at its input price. On a cache hit of either tier: the full flat price of the cached answer's tokens (what a miss would have billed), recorded next to `billed_usd`. Events written before cache-hit billing record 0 on hits. */
             flat_price_usd?: number;
+            /** @description `caliban/auto` only: what the customer is billed. `flat_price_usd` on a miss; on a cache hit of either tier, `flat_price_usd` x the tenant's cache-hit fraction (`auto_cache_hit_fraction`, default 0.2). Margin = billed_usd - routed_model_cost_usd. Absent on events written before cache-hit billing (they billed `flat_price_usd`). */
+            billed_usd?: number;
+            /** @description Cache hits only: what the hit saved the customer. `caliban/auto`: `flat_price_usd - billed_usd`. Other models: the model cost the hit avoided (the cached answer's tokens at the input and output price; nothing reached the provider). Absent on misses and for unpriced models. */
+            saved_usd?: number;
         };
         UsageReport: {
             events: components["schemas"]["UsageEvent"][];
@@ -2104,18 +2151,32 @@ export interface components {
                 requests?: number;
                 prompt_tokens?: number;
                 completion_tokens?: number;
+                /** @description Prompt tokens read from provider prompt caches */
+                cached_prompt_tokens?: number;
+                /** @description Prompt tokens written to provider prompt caches */
+                cache_write_tokens?: number;
+                /** @description Events with `usage_source: estimated` */
+                estimated_requests?: number;
                 /** @description Hits of both tiers. */
                 cache_hits?: number;
+                /** @description Sum of `saved_usd`: what cache hits saved customers, all models */
+                saved_usd?: number;
                 semantic_cache_hits?: number;
                 tokens_saved?: number;
                 cost_usd?: number;
                 /** @description Requests that asked for `caliban/auto` */
                 auto_requests?: number;
-                /** @description Sum over `caliban/auto` events that carry both prices */
+                /** @description `caliban/auto` requests answered by a cache tier (billed at the discounted price) */
+                auto_cache_hits?: number;
+                /** @description Full flat price, summed over `caliban/auto` events that carry both prices (cache hits at their full price) */
                 flat_price_usd?: number;
-                /** @description Sum over the same events */
+                /** @description What those events were billed: the flat price on misses, the discounted price on cache hits */
+                billed_usd?: number;
+                /** @description What `caliban/auto` cache hits saved customers: flat_price_usd - billed_usd over hits */
+                auto_saved_usd?: number;
+                /** @description Sum over the same events (0 on cache hits) */
                 routed_model_cost_usd?: number;
-                /** @description flat_price_usd - routed_model_cost_usd */
+                /** @description billed_usd - routed_model_cost_usd */
                 margin_usd?: number;
             };
         };
@@ -2192,6 +2253,30 @@ export interface components {
         /** @description Error (Anthropic shape) */
         AnthropicError: {
             headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AnthropicError"];
+            };
+        };
+        /**
+         * @description The PII model's queue is full (`CALIBAN_PII_NER_OVERFLOW=reject`, the default). The request
+         *     was not sent upstream; retry after `retry-after` seconds. `error.type` is `overloaded`.
+         */
+        Overloaded: {
+            headers: {
+                /** @description Seconds to wait before retrying. */
+                "retry-after"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The PII model's queue is full (Anthropic shape, `error.type` = `overloaded_error`). Nothing was sent upstream. */
+        AnthropicOverloaded: {
+            headers: {
+                "retry-after"?: number;
                 [name: string]: unknown;
             };
             content: {

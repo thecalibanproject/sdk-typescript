@@ -215,6 +215,18 @@ describe('CalibanAdmin', () => {
     expect(JSON.parse(m.calls[1]!.body!)).toEqual({ pii_default: 'mask' });
   });
 
+  it('sets and clears the cache-hit fraction for caliban/auto', async () => {
+    const m = mockFetch(json({ ...tenant, auto_cache_hit_fraction: 0.15 }), json({ ...tenant, auto_cache_hit_fraction: null }));
+    const a = admin(m.fetch);
+    const set = await a.tenants.update('t_1', { auto_cache_hit_fraction: 0.15 });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ auto_cache_hit_fraction: 0.15 });
+    expect(set.auto_cache_hit_fraction).toBe(0.15);
+    // null is sent as null (clears the override), not dropped.
+    const cleared = await a.tenants.update('t_1', { auto_cache_hit_fraction: null });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ auto_cache_hit_fraction: null });
+    expect(cleared.auto_cache_hit_fraction).toBeNull();
+  });
+
   it('PATCH throws a not-found CalibanAPIError on 404', async () => {
     const m = mockFetch(json({ error: { message: 'no such tenant', type: 'not_found', code: null } }, { status: 404 }));
     await expect(admin(m.fetch).tenants.update('gone', { semantic_cache: 'on' })).rejects.toMatchObject({
@@ -266,8 +278,10 @@ describe('CalibanAdmin', () => {
       requested_model: 'caliban/auto',
       intent_confidence: 0.912,
       route_stage: 'knn',
-      routed_model_cost_usd: 0.000026,
+      routed_model_cost_usd: 0,
       flat_price_usd: 0.00026,
+      billed_usd: 0.000052,
+      saved_usd: 0.000208,
     };
     const totals = {
       requests: 2,
@@ -277,10 +291,14 @@ describe('CalibanAdmin', () => {
       semantic_cache_hits: 1,
       tokens_saved: 19,
       cost_usd: 0.000026,
+      saved_usd: 0.000208,
       auto_requests: 1,
+      auto_cache_hits: 1,
       flat_price_usd: 0.00026,
-      routed_model_cost_usd: 0.000026,
-      margin_usd: 0.000234,
+      billed_usd: 0.000052,
+      auto_saved_usd: 0.000208,
+      routed_model_cost_usd: 0,
+      margin_usd: 0.000052,
     };
     const m = mockFetch(json({ events: [base, auto], totals }), json({ events: [base], totals: { requests: 1 } }));
     const a = admin(m.fetch);
@@ -295,16 +313,22 @@ describe('CalibanAdmin', () => {
       requested_model: 'caliban/auto',
       intent_confidence: 0.912,
       route_stage: 'knn',
-      routed_model_cost_usd: 0.000026,
+      routed_model_cost_usd: 0,
       flat_price_usd: 0.00026,
+      billed_usd: 0.000052,
+      saved_usd: 0.000208,
       tokens_saved: 19,
     });
+    expect(plain?.billed_usd).toBeUndefined();
     expect(report.totals).toEqual(totals);
-    expect(report.totals.margin_usd).toBeCloseTo(report.totals.flat_price_usd! - report.totals.routed_model_cost_usd!, 12);
+    // A caliban/auto cache hit is billed a share of the flat price; margin is billed minus routed cost.
+    expect(report.totals.margin_usd).toBeCloseTo(report.totals.billed_usd! - report.totals.routed_model_cost_usd!, 12);
+    expect(report.totals.auto_saved_usd).toBeCloseTo(report.totals.flat_price_usd! - report.totals.billed_usd!, 12);
     // An older control plane omits the new totals.
     const older = await a.usage.get();
     expect(older.totals.semantic_cache_hits).toBeUndefined();
     expect(older.totals.margin_usd).toBeUndefined();
+    expect(older.totals.billed_usd).toBeUndefined();
   });
 
   it('requires a token', () => {
