@@ -185,7 +185,7 @@ Every method takes the same `RequestOptions`:
 | `timeoutMs` | Overrides the client timeout for this call. |
 | `retry` | Merged over the client retry policy; `false` disables retries. |
 | `headers` | Extra headers for this call. |
-| `idempotencyKey` | Sent as the `Idempotency-Key` header, which makes this POST retryable on 502. Not sent unless you set it. |
+| `idempotencyKey` | Sent as the `Idempotency-Key` header, which makes this POST retryable on 502 and lets the gateway answer a retry from the first attempt instead of running it again (see [Errors, retries and timeouts](#errors-retries-and-timeouts)). Not sent unless you set it. |
 | `extraBody` | Extra JSON fields merged into the body (after the typed params, before `caliban`). |
 
 **Models.** Items from `models.list()` carry a `caliban` object (`kind`, `family`, `capabilities`, `trust_tier`). It is absent on the virtual `caliban/auto` entry.
@@ -491,7 +491,7 @@ What is retried depends on whether the request is safe to repeat:
 
 - A POST is never retried on 500, 502 or 504, because the gateway may already have run the request and billed it upstream. The same goes for a reset or timeout after the request was sent. In browsers fetch does not say whether the request was sent, so a failed POST is not retried there.
 - Network failures are not retried by default for any request; `retryOnNetworkError: true` turns that on within the limits above.
-- To make a POST retryable like a GET, pass `idempotencyKey` (or an `Idempotency-Key` header). The SDK never sends one on its own. The gateway does not deduplicate on this key yet, so a retry after a 502 can still run the request twice upstream; use a key only when that is acceptable, and a fresh one per logical request.
+- To make a POST retryable like a GET, pass `idempotencyKey` (or an `Idempotency-Key` header). The SDK never sends one on its own; use a fresh key per logical request and the same key for its retries. The gateway deduplicates on it for `chat.completions`, `messages`, `embeddings` and `rerank`: the first request runs (to completion, even if the connection drops); a retry after it finished gets the stored response for 24 h (header `idempotent-replayed: true`, nothing charged again; streams are replayed as one SSE body); a retry while it is still running gets `409` with code `idempotency_key_in_use` and `retry-after: 1`, which the SDK does not retry, so catch it and retry later; the same key with a different body gets `422` (`idempotency_key_reused`). A failed request frees its key. The admin API does not deduplicate: there a retried POST after a 502 can run twice.
 - Setting `retryOnStatus` explicitly applies your list to every request as-is, POSTs included. For example, `retry: { retryOnStatus: [429, 502, 503] }` restores the old behaviour of retrying POSTs on 502.
 - Once a stream has started, nothing is retried.
 
