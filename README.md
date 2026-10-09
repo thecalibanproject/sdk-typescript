@@ -1,102 +1,334 @@
-# @caliban/sdk
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/thecalibanproject/website/main/public/brand/logo-white.svg">
+  <img alt="Caliban" src="https://raw.githubusercontent.com/thecalibanproject/website/main/public/brand/logo.svg" width="200">
+</picture>
 
-TypeScript SDK for **Caliban**, the on-prem-capable, BYOK AI gateway.
+# Caliban TypeScript SDK
 
-- **Data plane** (`:8080`, `/v1/*`): an OpenAI-compatible client with typed Caliban extensions,
-  header metadata, SSE streaming, retries and typed errors.
-- **Control plane** (`:8081`, `/api/v1/*`): a fully typed admin client generated from
-  [`core/api/openapi.yaml`](../core/api/openapi.yaml).
-- **Node authoring**: `defineNode()`, typed from [`core/schemas/node.schema.json`](../core/schemas/node.schema.json).
+Typed TypeScript client for the Caliban AI gateway: OpenAI-compatible inference with Caliban extensions, the admin API, and node authoring.
 
-The package ships ESM and CJS builds plus type declarations. It runs on Node 20+, Bun, Deno,
-browsers and edge runtimes: it only needs `fetch`. Its one runtime dependency is
-[`openapi-fetch`](https://openapi-ts.dev/openapi-fetch/), and it sends **no telemetry**.
+[Docs](https://github.com/thecalibanproject/docs) · [Core](https://github.com/thecalibanproject/core) · [Python SDK](https://github.com/thecalibanproject/sdk-python)
 
-> **Licence:** [Apache-2.0](./LICENSE). Copyright 2026 Elie Sfeir. The package stays marked
-> `private` in `package.json` until it is published to a registry.
+## What it is
+
+[Caliban](https://github.com/thecalibanproject/core) is a sovereign AI gateway. It gives a company a single OpenAI- and Anthropic-compatible endpoint and handles:
+
+- intent classification and routing (`caliban/auto` picks the model);
+- PII screening and pseudonymisation before anything reaches an outside provider;
+- an ontology layer that compiles typed queries (CQIR) to MongoDB pipelines, or to SQL over a CDC replica;
+- exact and semantic caching;
+- agents ("nodes");
+- open-weight models (Qwen and others) served on your own hardware.
+
+Caliban is BYOK only: you bring your own provider keys or local model endpoints, and upstream keys are never pooled. It can run fully on-prem with zero egress. The core is a single Rust binary.
+
+This package, `@caliban/sdk`, covers three surfaces:
+
+| Surface | Where | In this SDK |
+|---|---|---|
+| Data plane (OpenAI-compatible) | `http://localhost:8080/v1` | `CalibanClient` |
+| Control plane (admin API) | `http://localhost:8081/api/v1` | `CalibanAdmin` |
+| Node authoring | types from `core/schemas/node.schema.json` | `defineNode()` |
+
+It ships ESM and CJS builds with type declarations and runs anywhere `fetch` exists: Node 20+, Bun, Deno, browsers and edge runtimes. The only runtime dependency is [`openapi-fetch`](https://openapi-ts.dev/openapi-fetch/). The SDK sends no telemetry and talks only to the URLs you configure.
+
+**Status:** Caliban is in active development with design partners. The SDK is at version 0.1.0 and its API may still change.
+
+## Install
+
+`@caliban/sdk` is not published to npm yet (the package is marked `private`). The build output is not committed and there is no `prepare` script, so `npm install github:thecalibanproject/sdk-typescript` will not give you a working package. Build it from source and install the tarball instead:
 
 ```sh
-pnpm add @caliban/sdk
+git clone https://github.com/thecalibanproject/sdk-typescript.git
+cd sdk-typescript
+pnpm install
+pnpm build
+npm pack            # writes caliban-sdk-0.1.0.tgz
 ```
 
----
+Then, in your project:
 
-## 1. Use the official `openai` package against Caliban
-
-Caliban speaks the OpenAI wire protocol, so the official SDK works unchanged: just point
-`baseURL` at the gateway and use a tenant key (`cal_…`). `@caliban/sdk` does **not** depend on
-`openai`; this section is documentation only.
-
-```ts
-import OpenAI from 'openai';
-
-const openai = new OpenAI({
-  apiKey: process.env.CALIBAN_API_KEY, // cal_…
-  baseURL: 'http://localhost:8080/v1',
-});
-
-const { data, response } = await openai.chat.completions
-  .create({
-    model: 'caliban/auto',
-    messages: [{ role: 'user', content: 'Summarise last quarter’s churn.' }],
-    // The extension is passed through as an extra body field. Plain OpenAI types don't know it:
-    // @ts-expect-error Caliban extension
-    caliban: { pii: 'reversible', cache: 'semantic', datasources: ['sales_dw'] },
-  })
-  .withResponse();
-
-console.log(data.choices[0]?.message.content);
-console.log(response.headers.get('x-caliban-routed-model'), response.headers.get('x-caliban-cache'));
+```sh
+npm install /path/to/sdk-typescript/caliban-sdk-0.1.0.tgz
 ```
 
-You can import `CalibanExtension` from `@caliban/sdk` to type that object
-(`caliban: { … } satisfies CalibanExtension`).
+`pnpm add` and `yarn add` accept the same tarball path.
 
-## 2. `CalibanClient` (data plane)
+## Quick start
+
+You need a running Caliban gateway and a tenant API key (`cal_…`).
 
 ```ts
 import { CalibanClient } from '@caliban/sdk';
 
 const caliban = new CalibanClient({
   apiKey: process.env.CALIBAN_API_KEY,  // defaults to $CALIBAN_API_KEY
-  baseURL: 'http://localhost:8080/v1',  // defaults to $CALIBAN_BASE_URL or this value
-  defaultCaliban: { pii: 'reversible' }, // merged into every request (request keys win)
+  baseURL: 'http://localhost:8080/v1',  // defaults to $CALIBAN_BASE_URL, then this value
 });
 
 const completion = await caliban.chat.completions.create({
   model: 'caliban/auto',
   messages: [{ role: 'user', content: 'Which invoices are overdue for ACME?' }],
-  caliban: {
-    pii: 'reversible',          // off | mask | reversible
-    cache: 'exact',             // off | exact | semantic
-    datasources: ['sales_dw'],
-    node: 'invoice-triage',
-    max_cost_usd: 0.05,
-    reasoning: 'low',           // off | low | medium | high (reasoning models only)
-    zdr: true,                  // zero data retention
-    trace_id: 'checkout-1234',
-  },
+  caliban: { pii: 'reversible', cache: 'semantic', datasources: ['sales'] },
 });
 
 console.log(completion.choices[0]?.message?.content);
-
-// Metadata from the x-caliban-* response headers. It sits on a non-enumerable `meta`
-// property, so JSON.stringify(completion) still gives the plain OpenAI shape.
-const { requestId, routedModel, cache, piiEntities, costUsd } = completion.meta;
-// costUsd comes from x-caliban-cost-usd: non-streaming only, null when the model has no price.
-
-const models = await caliban.models.list(); // GET /v1/models; items carry a `caliban` object
-// { kind, family, capabilities, trust_tier } (absent on the virtual `caliban/auto` entry)
-
-const { data } = await caliban.embeddings.create({ model: 'local/bge-m3', input: ['a', 'b'] }); // POST /v1/embeddings
+console.log(completion.meta.routedModel, completion.meta.cache, completion.meta.piiEntities);
 ```
 
-The request type has no open index signature on purpose. A typo such as `calliban:` fails to
-compile; otherwise the PII/ZDR policy you meant to apply would be dropped without any warning.
-To send other OpenAI-compatible fields, pass them through `{ extraBody: { … } }` in the request
-options.
+## Core concepts
 
-### Streaming
+### The `caliban` request extension
+
+Every data-plane request body can carry a `caliban` object. Clients that do not know about it simply leave it out, so the gateway stays wire-compatible with OpenAI. The type is exported as `CalibanExtension`.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `pii` | `off`, `mask`, `reversible` | How PII is handled before text leaves your trust boundary. `mask` replaces entities with placeholders such as `[EMAIL]`; `reversible` pseudonymises them and restores the originals in the response. |
+| `cache` | `off`, `exact`, `semantic` | Response cache mode. |
+| `datasources` | `string[]` | Datasources (by name) the request may query through the ontology layer. |
+| `node` | `string` | Run the request through a named node (agent). |
+| `max_cost_usd` | number, `>= 0` | Cost ceiling for the request. |
+| `reasoning` | `off`, `low`, `medium`, `high` | Reasoning effort, translated for the model family (see [Reasoning models](#reasoning-models)). |
+| `zdr` | `boolean` | Zero data retention. |
+| `trace_id` | `string` | Your own correlation id. |
+
+Fields you leave out take the gateway's defaults (in the API contract: `pii: 'reversible'`, `cache: 'exact'`, `zdr: false`).
+
+Set defaults for every chat request with `defaultCaliban`. Request-level keys win:
+
+```ts
+const caliban = new CalibanClient({ defaultCaliban: { pii: 'reversible', zdr: true } });
+```
+
+The SDK checks the extension before sending: `max_cost_usd` must be a finite number `>= 0`, `reasoning` must be one of the four values, and `datasources` must be an array. A failure throws `CalibanError` with `type: 'invalid_request_error'`.
+
+The chat request type deliberately has no open index signature. A typo such as `calliban:` is a compile error instead of a silently dropped PII or ZDR policy. To send other OpenAI-compatible fields, use `extraBody` in the request options.
+
+### Response metadata
+
+The gateway reports what it did in `x-caliban-*` response headers. The SDK parses them into a `CalibanResponseMeta` on a non-enumerable `meta` property, so `JSON.stringify(completion)` still gives the plain OpenAI shape.
+
+| Header | `meta` field | Notes |
+|---|---|---|
+| `x-caliban-request-id` | `requestId` | Quote it in bug reports. |
+| `x-caliban-routed-model` | `routedModel` | The model the router actually used (useful with `caliban/auto`). |
+| `x-caliban-cache` | `cache` | `hit`, `miss` or `bypass`. |
+| `x-caliban-pii-entities` | `piiEntities` | Number of PII entities detected and protected. |
+| `x-caliban-cost-usd` | `costUsd` | Non-streaming responses only; `null` when the model has no price. |
+
+`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`), and `parseResponseMeta(response)` works on any `Response`.
+
+### Reasoning models
+
+`caliban.reasoning` is translated for the model family: Qwen3's `enable_thinking` switch, or `reasoning_effort` for models that take one. `off` disables thinking on hybrid models. The thinking text comes back in `reasoning_content`, separate from the answer in `content`; Caliban also moves inline `<think>…</think>` blocks there. `reasoningText()` reads `reasoning_content` and falls back to `reasoning`, the name some servers use.
+
+```ts
+import { CalibanClient, reasoningText } from '@caliban/sdk';
+
+const caliban = new CalibanClient();
+
+const res = await caliban.chat.completions.create({
+  model: 'local/qwen3-8b',
+  messages: [{ role: 'user', content: 'Is 3599 prime?' }],
+  caliban: { reasoning: 'high' },
+});
+console.log(reasoningText(res.choices[0]?.message)); // the thinking
+console.log(res.choices[0]?.message?.content);       // the answer
+```
+
+See [Streaming](#streaming) for separating reasoning from content in a stream.
+
+## API reference highlights
+
+### `CalibanClient` (data plane)
+
+```ts
+new CalibanClient(options?: CalibanClientOptions)
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `apiKey` | `$CALIBAN_API_KEY` | Tenant key (`cal_…`). Required. |
+| `baseURL` | `$CALIBAN_BASE_URL` or `http://localhost:8080/v1` | Includes `/v1`, like the OpenAI SDK. |
+| `defaultCaliban` | none | Merged into every chat request. |
+| `timeoutMs` | `600_000` | Per attempt. For streams it covers the time until headers arrive. |
+| `retry` | 2 retries on 429, 502, 503 | `RetryOptions`, or `false` to disable. |
+| `defaultHeaders` | none | Sent on every request. |
+| `fetch` | `globalThis.fetch` | Custom fetch, for example for proxies or tests. |
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `chat.completions.create(params, options?)` | `POST /v1/chat/completions` | `WithMeta<ChatCompletion>`, or a `ChatCompletionStream` when `stream: true` |
+| `embeddings.create(params, options?)` | `POST /v1/embeddings` | `WithMeta<CreateEmbeddingResponse>` |
+| `rerank.create(params, options?)` | `POST /v1/rerank` | `WithMeta<RerankResponse>` |
+| `models.list(options?)` | `GET /v1/models` | `WithMeta<ModelList>` |
+
+Every method takes the same `RequestOptions`:
+
+| Option | Notes |
+|---|---|
+| `signal` | An `AbortSignal` to cancel the request. |
+| `timeoutMs` | Overrides the client timeout for this call. |
+| `retry` | Merged over the client retry policy; `false` disables retries. |
+| `headers` | Extra headers for this call. |
+| `extraBody` | Extra JSON fields merged into the body (after the typed params, before `caliban`). |
+
+**Models.** Items from `models.list()` carry a `caliban` object (`kind`, `family`, `capabilities`, `trust_tier`). It is absent on the virtual `caliban/auto` entry.
+
+**Embeddings.**
+
+```ts
+const res = await caliban.embeddings.create({
+  model: 'local/bge-m3',                        // a model registered with kind: 'embedding'
+  input: ['first passage', 'second passage'],   // a string or an array of strings
+});
+const vectors = res.data.map((d) => d.embedding);
+console.log(res.meta.routedModel, res.meta.piiEntities);
+```
+
+Inputs sent to a provider outside the trust boundary are PII-masked (`[EMAIL]`, `[PERSON]`, and so on), not pseudonymised, because vectors cannot be rehydrated. `dimensions`, `encoding_format: 'float'` and `user` are also accepted.
+
+**Rerank.** Score candidate passages against a query with a model registered as `kind: 'rerank'`, for example Qwen3-Reranker on vLLM or bge-reranker on TEI.
+
+```ts
+const docs = ['Paris is in France.', 'Bananas are yellow.', 'The Eiffel Tower is in Paris.'];
+const res = await caliban.rerank.create({
+  model: 'local/qwen3-reranker',
+  query: 'Where is the Eiffel Tower?',
+  documents: docs,          // at least one string
+  top_n: 2,                 // optional: keep only the best N
+  return_documents: true,   // optional: echo the text in results[].document.text
+});
+for (const r of res.results) console.log(r.relevance_score, docs[r.index]); // best first
+```
+
+`results` keep the server's order (highest `relevance_score` first) and `index` points into `documents`. The SDK rejects a non-string query, an empty or non-string `documents` array and an invalid `top_n` before sending. Text sent outside the trust boundary is PII-masked; returned documents are always your originals.
+
+### `CalibanAdmin` (control plane)
+
+Thin helpers over a fully typed `openapi-fetch` client generated from the [core API contract](https://github.com/thecalibanproject/core/blob/main/api/openapi.yaml). Never ship an admin token to a browser.
+
+```ts
+import { CalibanAdmin } from '@caliban/sdk';
+
+const admin = new CalibanAdmin({
+  token: process.env.CALIBAN_ADMIN_TOKEN, // defaults to $CALIBAN_ADMIN_TOKEN
+  baseUrl: 'http://localhost:8081',       // origin without /api/v1; defaults to $CALIBAN_ADMIN_URL, then this value
+});
+
+const tenant = await admin.tenants.create({ name: 'Acme', pii_default: 'reversible' });
+
+// BYOK: a provider key, or a keyless on-prem endpoint (vLLM, Ollama, ...)
+await admin.providerKeys.create(tenant.id, {
+  kind: 'openai_compatible',
+  label: 'on-prem vLLM',
+  base_url: 'http://vllm:8000/v1',
+  trust_tier: 't0_sovereign',
+});
+
+const { key } = await admin.apiKeys.create(tenant.id, { name: 'ci' }); // plaintext, shown once
+
+const ds = await admin.datasources.create({
+  tenant_id: tenant.id,
+  kind: 'mongodb',
+  name: 'sales',
+  connection: { uri: 'mongodb://mongo:27017', database: 'sales' },
+});
+await admin.datasources.introspect(ds.id); // starts a job, returns { job_id }
+
+const ontology = await admin.ontology.get({ tenant_id: tenant.id });
+for (const el of ontology.elements.filter((e) => e.status === 'proposed')) {
+  await admin.ontology.review(el.id, { decision: 'approve', note: 'checked by data team' });
+}
+
+const usage = await admin.usage.get({ tenant_id: tenant.id, limit: 50 });
+console.log(usage.totals.tokens_saved);
+
+// Anything without a helper: the typed openapi-fetch client
+const { data } = await admin.raw.GET('/api/v1/health');
+```
+
+| Helper | Methods |
+|---|---|
+| `tenants` | `list`, `create`, `get` |
+| `apiKeys` | `list`, `create` |
+| `providerKeys` | `list`, `create`, `delete` (the server crypto-shreds the secret) |
+| `models` | `list`, `create`, `delete` |
+| `providers` | `list`, `create`, `delete`, `health`, `discover` |
+| `datasources` | `list`, `create`, `introspect` |
+| `ontology` | `get`, `review` |
+| `nodes` | `list`, `create` |
+| `usage` | `get` |
+| `health()` | `GET /api/v1/health` |
+| `raw` | the underlying `openapi-fetch` client |
+
+Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body read), `retry`, `headers`, `fetch`. Each helper also takes `{ signal, headers }` as its last argument. Non-2xx responses throw `CalibanAPIError`.
+
+### Open models on-prem
+
+Caliban can route to open models you serve yourself (vLLM, SGLang, llama.cpp, Ollama, TEI) through any OpenAI-compatible endpoint. Traffic to a `t0_sovereign` server never leaves your network.
+
+```ts
+const admin = new CalibanAdmin();
+
+// 1. A shared model server, usable by all tenants (or an allow-list in `tenants`).
+await admin.providers.create({
+  id: 'gpu-pool',
+  kind: 'openai_compatible',
+  base_url: 'http://vllm.internal:8000/v1',
+  trust_tier: 't0_sovereign',
+  cache_salt: true, // per-tenant vLLM prefix-cache isolation
+});
+console.log(await admin.providers.health('gpu-pool')); // { status, latency_ms, models }
+
+// 2. Ask the server what it serves. Caliban suggests catalogue entries (kind, family,
+//    reasoning capabilities) for unregistered models. Suggestions are heuristic: review them.
+const { available, suggested } = await admin.providers.discover('gpu-pool');
+
+// 3. Register the ones you want, adjusting fields as needed.
+for (const s of suggested.filter((s) => s.upstream_model.startsWith('Qwen/') || s.kind === 'embedding')) {
+  await admin.models.create({ ...s, context_window: s.context_window ?? 32_768 });
+}
+
+// Model ids contain '/'. The SDK keeps the slash unescaped, as the API expects.
+await admin.models.delete('local/old-model'); // 409 if a route still uses it
+```
+
+Background on model choice, serving engines and hardware tiers is in [research note 09](https://github.com/thecalibanproject/docs/blob/main/research/09-open-models-on-prem.md).
+
+### `defineNode` (node authoring)
+
+`defineNode()` type-checks a node spec against `core/schemas/node.schema.json` and returns it unchanged, keeping literal types. Unknown top-level keys, wrong enum values and missing required fields are compile errors. Constraints TypeScript cannot express (`minimum`, `maximum`, `pattern`) are checked by the control plane.
+
+```ts
+import { CalibanAdmin, defineNode } from '@caliban/sdk';
+
+export const invoiceTriage = defineNode({
+  kind: 'agent',
+  description: 'Classify inbound invoices and flag anomalies.',
+  prompt: { system: 'You triage supplier invoices.', output_schema: { type: 'object' } },
+  model_policy: {
+    candidates: ['tier:small', 'tier:frontier'],
+    escalate_on: ['schema_violation', 'low_confidence'],
+    min_trust_tier: 't1_attested',
+    max_cost_usd: 0.02,
+  },
+  tools: [{ ref: 'mcp://erp/lookup_invoice#sha256:<hash>', effect: 'read' }],
+  datasources: { scopes: ['erp.invoices:read'] },
+  guardrails: { pii: 'reversible', injection_mode: 'plan_then_execute' },
+  budgets: { steps: 12, tokens: 40_000, wall_clock_s: 90 },
+  exposure: { http: true, mcp_tool: true },
+});
+
+await new CalibanAdmin().nodes.create({ tenant_id: 't_1', name: 'invoice-triage', spec: invoiceTriage });
+```
+
+Once created, a node is called from the data plane with `caliban: { node: 'invoice-triage' }`. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
+
+## Streaming
+
+With `stream: true`, `create()` resolves to a `ChatCompletionStream` as soon as the headers arrive, so `meta` is available before the first chunk.
 
 ```ts
 const stream = await caliban.chat.completions.create({
@@ -106,21 +338,39 @@ const stream = await caliban.chat.completions.create({
   caliban: { cache: 'off' },
 });
 
-console.log('routed to', stream.meta.routedModel); // headers arrive before the body
+console.log('routed to', stream.meta.routedModel);
 
 for await (const chunk of stream) {
   process.stdout.write(chunk.choices[0]?.delta.content ?? '');
 }
-// or: const text = await stream.text();
 ```
 
-The SSE parser follows the WHATWG spec. It handles `data: [DONE]`, events with several
-`data:` lines, comments and keep-alives, `\n`, `\r\n` and bare `\r` line endings, and chunk
-boundaries anywhere, including inside a UTF-8 character or between the `\r` and `\n` of a
-CRLF pair. If the gateway sends an error mid-stream (`event: error` or `{"error": …}`), you get
-a `CalibanStreamError`.
+A stream can be consumed once. Instead of iterating it yourself you can call:
 
-### Errors, retries, timeouts, cancellation
+- `stream.text()`: the concatenated answer (`delta.content` of choice 0);
+- `stream.textParts()`: an async generator of `{ type: 'reasoning' | 'content', text }`;
+- `stream.collect()`: `{ reasoning, content }` as two strings.
+
+`stream.abort()` cancels the underlying request.
+
+```ts
+const stream = await caliban.chat.completions.create({
+  model: 'local/qwen3-8b',
+  messages: [{ role: 'user', content: 'Plan a 3-step migration.' }],
+  stream: true,
+  caliban: { reasoning: 'medium' },
+});
+for await (const part of stream.textParts()) {
+  if (part.type === 'reasoning') process.stderr.write(part.text);
+  else process.stdout.write(part.text);
+}
+```
+
+Reasoning deltas are read from `delta.reasoning_content`, falling back to `delta.reasoning`.
+
+The SSE parser follows the WHATWG rules: `data: [DONE]`, multi-line `data:` fields, comments and keep-alives, `\n`, `\r\n` and bare `\r` line endings, and chunk boundaries anywhere (including inside a UTF-8 character or between the `\r` and `\n` of a CRLF pair). `SSEDecoder`, `iterSSEEvents` and `iterJSONChunks` are exported if you need them directly.
+
+## Errors, retries and timeouts
 
 ```ts
 import { CalibanAPIError, CalibanAbortError, isCalibanError } from '@caliban/sdk';
@@ -133,253 +383,123 @@ try {
   );
 } catch (err) {
   if (err instanceof CalibanAPIError) {
-    // Mirrors the contract's Error shape: { error: { message, type, code } }
+    // Mirrors the contract's error body: { error: { message, type, code } }
     console.error(err.status, err.type, err.code, err.message, err.requestId);
   } else if (err instanceof CalibanAbortError) {
-    /* cancelled */
+    // cancelled
+  } else if (isCalibanError(err)) {
+    // any other SDK error
   }
 }
 ```
 
-| Error class | When |
+| Class | When |
 |---|---|
-| `CalibanAPIError` | Non-2xx response. `status`, `type` (e.g. `policy_violation`, `rate_limited`), `code`, `requestId`. |
-| `CalibanConnectionError` | No response (DNS, reset, …). `CalibanTimeoutError` is a subclass. |
+| `CalibanAPIError` | Non-2xx response. Has `status`, `type` (for example `policy_violation`, `rate_limited`, `upstream_error`), `code`, `requestId`, `headers` and `body`. |
+| `CalibanConnectionError` | No response (DNS failure, connection reset, and so on). |
+| `CalibanTimeoutError` | Subclass of `CalibanConnectionError`: the attempt exceeded `timeoutMs`. |
 | `CalibanAbortError` | Your `AbortSignal` fired, or you called `stream.abort()`. |
-| `CalibanStreamError` | A stream that had already started failed (error event, bad chunk, dropped connection). |
+| `CalibanStreamError` | A started stream failed: an `event: error` or `{"error": …}` payload, an unparseable chunk, or a dropped connection. |
 
-All of them extend `CalibanError`. `isCalibanError()` also works when two copies of the SDK
-are loaded.
+All of them extend `CalibanError`, which is also thrown directly for client-side problems such as a missing API key (`type: 'configuration_error'`) or invalid parameters (`type: 'invalid_request_error'`). `isCalibanError()` works even when two copies of the SDK are loaded (for example ESM and CJS in one process).
 
-**Retries:** 2 retries by default on **429, 502 and 503**. The delay grows exponentially from
-500 ms up to 8 s, with jitter, and the client honours `retry-after-ms` and `retry-after` up to
-60 s. You can configure this per client or per request; `retry: false` turns it off.
-Network-level failures are **not** retried by default (`retryOnNetworkError: true` turns that
-on), because a chat completion may already have been billed upstream. **Once a stream has
-started, nothing is retried.** The timeout (default 10 min) applies to each attempt. For
-streams it only covers the time until the headers arrive.
+**Retries.** By default the client retries twice on 429, 502 and 503. The delay grows exponentially from 500 ms to at most 8 s, with jitter, and the client honours `retry-after-ms` and `retry-after` when they ask for 60 s or less. Configure retries per client or per request with `RetryOptions` (`maxRetries`, `initialDelayMs`, `maxDelayMs`, `backoffMultiplier`, `jitter`, `retryOnStatus`, `retryOnNetworkError`, `respectRetryAfter`), or pass `retry: false`.
 
-## 3. `CalibanAdmin` (control plane)
+- Network failures are not retried by default (`retryOnNetworkError: true` turns that on), because a chat completion may already have been billed upstream.
+- A 502 is retried by default, POST requests included. The gateway does not support idempotency keys yet, so if a duplicate upstream call would matter, use `retry: { retryOnStatus: [429, 503] }`.
+- Once a stream has started, nothing is retried.
 
-```ts
-import { CalibanAdmin } from '@caliban/sdk';
+**Timeouts.** The timeout (default 10 minutes for `CalibanClient`, 60 s for `CalibanAdmin`) applies to each attempt. For streams it only covers the time until headers arrive.
 
-const admin = new CalibanAdmin({
-  token: process.env.CALIBAN_ADMIN_TOKEN, // defaults to $CALIBAN_ADMIN_TOKEN
-  baseUrl: 'http://localhost:8081',       // defaults to $CALIBAN_ADMIN_URL or this value
-});
+## Using the stock OpenAI and Anthropic SDKs
 
-const tenant = await admin.tenants.create({ name: 'Acme', pii_default: 'reversible' });
+You do not need this package to use Caliban. `@caliban/sdk` does not depend on `openai` or `@anthropic-ai/sdk`; this section is documentation only.
 
-// BYOK: a customer key, or a keyless on-prem endpoint (vLLM, Ollama, …)
-await admin.providerKeys.create(tenant.id, {
-  kind: 'openai_compatible',
-  label: 'on-prem vLLM',
-  base_url: 'http://vllm:8000/v1',
-  trust_tier: 't0_sovereign',
-});
-
-const { key } = await admin.apiKeys.create(tenant.id, { name: 'ci' }); // plaintext shown once
-
-const ds = await admin.datasources.create({
-  tenant_id: tenant.id, kind: 'postgres', name: 'sales_dw',
-  connection: { url: 'postgres://…' },
-});
-await admin.datasources.introspect(ds.id);
-
-const ontology = await admin.ontology.get({ tenant_id: tenant.id });
-for (const el of ontology.elements.filter((e) => e.status === 'proposed')) {
-  await admin.ontology.review(el.id, { decision: 'approve', note: 'checked by data team' });
-}
-
-const usage = await admin.usage.get({ tenant_id: tenant.id, limit: 50 });
-console.log(usage.totals.tokens_saved);
-
-// Anything not wrapped yet: the fully typed openapi-fetch client
-const { data } = await admin.raw.GET('/api/v1/health');
-```
-
-Helpers: `tenants` (list/create/get), `apiKeys` (list/create), `providerKeys`
-(list/create/delete), `models` (list/create/delete), `providers` (list/create/delete/health/discover),
-`datasources` (list/create/introspect), `ontology` (get/review), `nodes` (list/create), `usage.get`
-and `health()`. Non-2xx responses throw a `CalibanAPIError`.
-
-## 4. Open models on-prem (Qwen etc.)
-
-Caliban can route to open models you serve yourself (vLLM, SGLang, llama.cpp, Ollama, TEI…)
-through any OpenAI-compatible endpoint. Traffic to a `t0_sovereign` server never leaves your
-network.
-
-### Register an on-prem server and its models (control plane)
+**OpenAI SDK.** Point `baseURL` at the gateway and use a tenant key. The extension is sent as an extra body field:
 
 ```ts
-import { CalibanAdmin } from '@caliban/sdk';
+import OpenAI from 'openai';
 
-const admin = new CalibanAdmin();
-
-// 1. A shared model server, usable by all tenants (or an allow-list in `tenants`).
-await admin.providers.create({
-  id: 'gpu-pool',
-  kind: 'openai_compatible',
-  base_url: 'http://vllm.internal:8000/v1',
-  trust_tier: 't0_sovereign',
-  cache_salt: true, // per-tenant vLLM prefix-cache isolation
+const openai = new OpenAI({
+  apiKey: process.env.CALIBAN_API_KEY, // cal_...
+  baseURL: 'http://localhost:8080/v1',
 });
-console.log(await admin.providers.health('gpu-pool')); // { status: 'ok', latency_ms, models }
 
-// 2. Ask the server what it serves. Caliban suggests catalogue entries (kind, family,
-//    reasoning capabilities…) for models that are not registered yet. Suggestions are
-//    heuristic: review them before saving.
-const { available, suggested } = await admin.providers.discover('gpu-pool');
-console.log(available); // e.g. ['Qwen/Qwen3-8B', 'BAAI/bge-m3']
+const { data, response } = await openai.chat.completions
+  .create({
+    model: 'caliban/auto',
+    messages: [{ role: 'user', content: 'Summarise last quarter’s churn.' }],
+    // @ts-expect-error Caliban extension, unknown to the OpenAI types
+    caliban: { pii: 'reversible', cache: 'semantic', datasources: ['sales'] },
+  })
+  .withResponse();
 
-// 3. Register the ones you want, adjusting fields as needed.
-for (const s of suggested.filter((s) => s.upstream_model.startsWith('Qwen/') || s.kind === 'embedding')) {
-  await admin.models.create({ ...s, context_window: s.context_window ?? 32_768 });
-}
-
-// Model ids contain '/', e.g. local/qwen3-8b. The SDK sends them unescaped, as the API expects.
-await admin.models.delete('local/old-model'); // 409 if a route still uses it
+console.log(data.choices[0]?.message.content);
+console.log(response.headers.get('x-caliban-routed-model'), response.headers.get('x-caliban-cache'));
 ```
 
-### Reasoning toggle
+You can import `CalibanExtension` from `@caliban/sdk` to type that object (`caliban: { … } satisfies CalibanExtension`).
 
-`caliban.reasoning` (`off | low | medium | high`) is translated for the model family: Qwen3's
-`enable_thinking` switch, `reasoning_effort` for models that take one. Thinking comes back in
-`reasoning_content` (Caliban also moves inline `<think>…</think>` blocks there), separate from the
-answer in `content`.
+**Anthropic SDK.** The gateway also serves the Anthropic Messages API (`POST /v1/messages`, plus an approximate `POST /v1/messages/count_tokens`) through the same pipeline. Point `baseURL` at the gateway root, without `/v1`. The SDK sends the tenant key as `x-api-key`, which Caliban accepts.
 
 ```ts
-import { CalibanClient, reasoningText } from '@caliban/sdk';
+import Anthropic from '@anthropic-ai/sdk';
 
-const caliban = new CalibanClient();
-
-// Fast path: thinking off.
-const quick = await caliban.chat.completions.create({
-  model: 'local/qwen3-8b',
-  messages: [{ role: 'user', content: 'Capital of France?' }],
-  caliban: { reasoning: 'off' },
+const anthropic = new Anthropic({
+  apiKey: process.env.CALIBAN_API_KEY, // cal_...
+  baseURL: 'http://localhost:8080',
 });
 
-// Think hard, and keep the reasoning apart from the answer.
-const res = await caliban.chat.completions.create({
-  model: 'local/qwen3-8b',
-  messages: [{ role: 'user', content: 'Is 3599 prime?' }],
-  caliban: { reasoning: 'high' },
-});
-console.log(reasoningText(res.choices[0]?.message)); // reasoning_content (or `reasoning`)
-console.log(res.choices[0]?.message?.content);       // the answer
+const { data, response } = await anthropic.messages
+  .create({
+    model: 'caliban/auto',
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: 'Summarise last quarter’s churn.' }],
+    // @ts-expect-error Caliban extension, unknown to the Anthropic types
+    caliban: { pii: 'reversible' },
+  })
+  .withResponse();
 
-// Streaming: textParts() tags each delta; collect() returns both strings.
-const stream = await caliban.chat.completions.create({
-  model: 'local/qwen3-8b',
-  messages: [{ role: 'user', content: 'Plan a 3-step migration.' }],
-  stream: true,
-  caliban: { reasoning: 'medium' },
-});
-for await (const part of stream.textParts()) {
-  if (part.type === 'reasoning') process.stderr.write(part.text);
-  else process.stdout.write(part.text);
-}
-// or: const { reasoning, content } = await stream.collect();
+console.log(data.content, response.headers.get('x-caliban-routed-model'));
 ```
 
-Streams read `delta.reasoning_content` and fall back to `delta.reasoning`, which some servers use.
-`stream.text()` returns the answer only.
+When the routed model is an Anthropic model the request is passed through natively (`cache_control` breakpoints are kept and `anthropic-beta` is forwarded); otherwise the request and response, including stream events, are translated. `thinking` maps to `caliban.reasoning`. Errors use the Anthropic error shape.
 
-### Embeddings
+The `x-caliban-*` headers are CORS-exposed, so browser clients can read them too.
 
-```ts
-const res = await caliban.embeddings.create({
-  model: 'local/bge-m3',               // a model registered with kind: 'embedding'
-  input: ['first passage', 'second passage'], // a string or an array of strings
-});
-const vectors = res.data.map((d) => d.embedding);
-console.log(res.meta.routedModel, res.meta.piiEntities);
-```
-
-Inputs sent to a provider outside the trust boundary are PII-masked (`[EMAIL]`, `[PERSON]`…), not
-pseudonymised, because vectors cannot be rehydrated. Pass server-specific fields through
-`{ extraBody: { … } }`.
-
-### Rerank
-
-Score candidate passages against a query with a rerank model, e.g. Qwen3-Reranker served by
-vLLM or bge-reranker served by TEI, registered with `kind: 'rerank'`.
-
-```ts
-const docs = ['Paris is in France.', 'Bananas are yellow.', 'The Eiffel Tower is in Paris.'];
-const res = await caliban.rerank.create({
-  model: 'local/qwen3-reranker',  // or e.g. 'local/bge-reranker-v2-m3' on TEI
-  query: 'Where is the Eiffel Tower?',
-  documents: docs,                 // at least one string
-  top_n: 2,                        // optional: keep only the best N
-  return_documents: true,          // optional: echo the text in results[].document.text
-});
-for (const r of res.results) console.log(r.relevance_score, docs[r.index]); // best first
-console.log(res.meta.requestId, res.meta.routedModel);
-```
-
-`results` keep the server's order (highest `relevance_score` first); `index` points into
-`documents`. The SDK rejects an empty `documents` array, a non-string document or an invalid
-`top_n` before sending. Text sent outside the trust boundary is PII-masked, and returned
-documents are always your originals.
-
-## 5. `defineNode` (node authoring)
-
-```ts
-import { CalibanAdmin, defineNode } from '@caliban/sdk';
-
-export const invoiceTriage = defineNode({
-  kind: 'agent',
-  description: 'Classify inbound invoices and flag anomalies.',
-  prompt: { system: 'You triage supplier invoices…', output_schema: { type: 'object' } },
-  model_policy: {
-    candidates: ['tier:small', 'tier:frontier'],
-    escalate_on: ['schema_violation', 'low_confidence'],
-    min_trust_tier: 't1_attested',
-    max_cost_usd: 0.02,
-  },
-  tools: [{ ref: 'mcp://erp/lookup_invoice#sha256:…', effect: 'read' }],
-  datasources: { scopes: ['erp.invoices:read'] },
-  guardrails: { pii: 'reversible', injection_mode: 'plan_then_execute' },
-  budgets: { steps: 12, tokens: 40_000, wall_clock_s: 90 },
-  exposure: { http: true, mcp_tool: true },
-});
-
-await new CalibanAdmin().nodes.create({ tenant_id: 't_1', name: 'invoice-triage', spec: invoiceTriage });
-```
-
-`defineNode` returns its argument unchanged and keeps literal types. Unknown top-level keys,
-wrong enums and missing required fields are compile errors. Constraints that TypeScript cannot
-express (`minimum`, `maximum`, `pattern`) are checked by the control plane.
-
----
-
-## Development
-
-The `core` repo has to be checked out next to this one (`~/caliban/core`) for code generation.
-Generated files are committed under `src/generated/`, so a normal build does not need `core`.
-
-```sh
-pnpm install
-pnpm gen:api       # core/api/openapi.yaml        -> src/generated/schema.ts (openapi-typescript)
-pnpm gen:schemas   # core/schemas/node.schema.json -> src/generated/node.ts   (json-schema-to-typescript)
-pnpm typecheck
-pnpm test          # vitest run (one-shot, fetch is mocked, no network); `pnpm test:watch` for watch mode
-pnpm build         # tsup -> dist/ (ESM + CJS + .d.ts/.d.cts)
-```
-
-The tooling needs Node 22.12+ (vitest 5). The published library supports Node 20+. pnpm's built-in
-`test` command rejects unknown flags such as `pnpm test --run`. Use `pnpm test`,
-`pnpm run test --run` or `pnpm test -- <vitest args>` instead.
+## Configuration
 
 | Env var | Used by | Default |
 |---|---|---|
-| `CALIBAN_API_KEY` | `CalibanClient` | (required) |
+| `CALIBAN_API_KEY` | `CalibanClient` | none (required) |
 | `CALIBAN_BASE_URL` | `CalibanClient` | `http://localhost:8080/v1` |
-| `CALIBAN_ADMIN_TOKEN` | `CalibanAdmin` | (required) |
+| `CALIBAN_ADMIN_TOKEN` | `CalibanAdmin` | none (required) |
 | `CALIBAN_ADMIN_URL` | `CalibanAdmin` | `http://localhost:8081` |
 
-These are only read where `process.env` exists. In browsers and edge runtimes, pass the values
-explicitly. Never ship an admin token to a browser.
+Environment variables are only read where `process.env` exists. In browsers and edge runtimes, pass the values explicitly.
+
+## Development and tests
+
+```sh
+pnpm install
+pnpm typecheck
+pnpm test          # vitest, one-shot; fetch is mocked, no network needed
+pnpm test:watch
+pnpm build         # tsup -> dist/ (ESM, CJS, .d.ts and .d.cts)
+```
+
+The dev tooling needs Node 22.12+ or 24+ (a vitest 5 requirement); the library itself supports Node 20+. pnpm's built-in `test` command rejects unknown flags such as `pnpm test --run`; use `pnpm test -- <vitest args>` instead.
+
+The API and node types are generated from the [core](https://github.com/thecalibanproject/core) repo and committed under `src/generated/`, so a normal build does not need `core`. To regenerate after a contract change, check out `core` next to this repo (as `../core`) and run:
+
+```sh
+pnpm gen:api       # core/api/openapi.yaml         -> src/generated/schema.ts
+pnpm gen:schemas   # core/schemas/node.schema.json -> src/generated/node.ts
+pnpm gen           # both
+```
+
+## Licence
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 Elie Sfeir.
+
+This SDK is open source. The Caliban gateway and the other Caliban repositories are proprietary and source-available under their own terms.
