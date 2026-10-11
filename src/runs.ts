@@ -147,8 +147,28 @@ function queryString(query: Record<string, string | number | undefined>): string
   return s ? `?${s}` : '';
 }
 
+const MAX_UNTRUSTED_POINTERS = 64;
+
+/**
+ * Check an `untrusted` value (run requests, and `caliban.untrusted` on chat requests): a boolean,
+ * or at most 64 JSON pointers (`''` or strings starting with `/`). Throws before anything is sent.
+ */
+export function validateUntrusted(value: unknown, field = 'untrusted'): void {
+  if (value === undefined || typeof value === 'boolean') return;
+  const fail = (message: string) =>
+    new CalibanError({ type: 'invalid_request_error', code: 'invalid_untrusted', message: `${field} ${message}` });
+  if (!Array.isArray(value)) throw fail('must be a boolean or an array of JSON pointers');
+  if (value.length > MAX_UNTRUSTED_POINTERS) throw fail(`takes at most ${MAX_UNTRUSTED_POINTERS} JSON pointers (got ${value.length})`);
+  for (const ptr of value) {
+    if (typeof ptr !== 'string' || (ptr !== '' && !ptr.startsWith('/'))) {
+      throw fail(`entries must be JSON pointers ('' or starting with '/'), got ${JSON.stringify(ptr)}`);
+    }
+  }
+}
+
 /** Build the JSON body for a run request (exported for tests and advanced use). */
 export function buildRunBody(params: RunCreateParams, extraBody?: Record<string, unknown>): Record<string, unknown> {
+  validateUntrusted(params.untrusted);
   const body: Record<string, unknown> = { ...params, ...extraBody };
   for (const [k, v] of Object.entries(body)) if (v === undefined) delete body[k];
   return body;
@@ -167,7 +187,10 @@ export class Runs {
    * (`wait_s`) with the run so far; check `status`. `async: true` resolves at once with the
    * pending run. `stream: true` resolves to a {@link RunEventStream} once headers arrive.
    *
-   * Pass `idempotencyKey` to make a retry return the run the first request created.
+   * Pass `idempotencyKey` to make a retry return the run the first request created. Mark untrusted
+   * caller data with `untrusted` (`true`, or JSON pointers such as `['/email/body']`): it carries
+   * the `caller` taint label (see the run's `input_labels`), so a write it reaches needs an
+   * `allow_tainted` entry or a human approval.
    */
   create(nodeName: string, params: RunCreateParamsNonStreaming, options?: RequestOptions): Promise<WithMeta<NodeRun>>;
   create(nodeName: string, params: RunCreateParamsStreaming, options?: RequestOptions): Promise<RunEventStream>;

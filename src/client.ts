@@ -3,7 +3,7 @@ import { readEnv, resolveFetch, trimTrailingSlash } from './internal/env.js';
 import { sendWithRetry } from './internal/http.js';
 import { attachMeta, parseResponseMeta } from './meta.js';
 import { IDEMPOTENCY_KEY_HEADER, isIdempotentRequest, resolveRetryPolicy, type RetryOptions, type RetryPolicy } from './retry.js';
-import { Runs } from './runs.js';
+import { Runs, validateUntrusted } from './runs.js';
 import { ChatCompletionStream } from './streaming.js';
 import type {
   CalibanExtension,
@@ -77,6 +77,7 @@ function validateExtension(ext: CalibanExtension): void {
       message: `caliban.reasoning must be one of off, low, medium, high (got ${String(ext.reasoning)})`,
     });
   }
+  validateUntrusted(ext.untrusted, 'caliban.untrusted');
   if (ext.datasources !== undefined && !Array.isArray(ext.datasources)) {
     throw new CalibanError({
       type: 'invalid_request_error',

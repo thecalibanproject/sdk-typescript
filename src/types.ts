@@ -303,6 +303,12 @@ type ContractRunCreate = paths['/v1/nodes/{nodeName}/runs']['post']['requestBody
  * input. `budget` can only lower the version's budget.
  */
 export type RunCreateParams = ContractRunCreate;
+/**
+ * Input the caller marks as untrusted data (taint label `caller`): `true` (all of it), `false`, or
+ * JSON pointers into the input (`'/email/body'`; `''` is the whole input), at most 64. Fields the
+ * node's input schema marks `x-caliban-untrusted` are untrusted whatever the caller sends.
+ */
+export type UntrustedInput = NonNullable<RunCreateParams['untrusted']>;
 export type RunCreateParamsNonStreaming = RunCreateParams & { stream?: false | undefined };
 export type RunCreateParamsStreaming = RunCreateParams & { stream: true };
 /** A node run (contract: `NodeRun`). */

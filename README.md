@@ -92,6 +92,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | `reasoning` | `off`, `low`, `medium`, `high` | Reasoning effort, translated for the model family (see [Reasoning models](#reasoning-models)). |
 | `zdr` | `boolean` | Zero data retention. |
 | `trace_id` | `string` | Your own correlation id. |
+| `untrusted` | `boolean`, or JSON pointers | With `model: 'node/<name>'` (or `caliban/auto` handing the request to a node): the node input you mark as untrusted data, like `untrusted` on [`runs.create()`](#calibanclient-data-plane). |
 
 Fields you leave out take the gateway's defaults (in the API contract: `pii: 'reversible'`, `cache: 'exact'`, `zdr: false`).
 
@@ -101,7 +102,7 @@ Set defaults for every chat request with `defaultCaliban`. Request-level keys wi
 const caliban = new CalibanClient({ defaultCaliban: { pii: 'reversible', zdr: true } });
 ```
 
-The SDK checks the extension before sending: `max_cost_usd` must be a finite number `>= 0`, `reasoning` must be one of the four values, and `datasources` must be an array. A failure throws `CalibanError` with `type: 'invalid_request_error'`.
+The SDK checks the extension before sending: `max_cost_usd` must be a finite number `>= 0`, `reasoning` must be one of the four values, `datasources` must be an array, and `untrusted` must be a boolean or at most 64 JSON pointers. A failure throws `CalibanError` with `type: 'invalid_request_error'`.
 
 The chat request type deliberately has no open index signature. A typo such as `calliban:` is a compile error instead of a silently dropped PII or ZDR policy. To send other OpenAI-compatible fields, use `extraBody` in the request options.
 
@@ -248,7 +249,16 @@ for await (const ev of stream) console.log(ev.id, ev.type, ev.data); // step.sta
 console.log(stream.run?.status); // the run, from the last event
 ```
 
-- `async: true` answers at once with the pending run; poll `runs.get()` or follow `runs.events()`. `version` runs a published version other than the live one; `budget` can only lower the version's budget for this run; `chat: { messages }` replaces `input` with chat messages.
+- **Untrusted caller data.** Input you pass is trusted by default: the API key that may run the node is the principal. When part of it comes from someone else (an email body, a web page, a ticket), mark it with `untrusted`: `true` for the whole input, or JSON pointers to fields (`['/email/body']`; `''` is the whole input; at most 64, checked before sending). Marked values make the run input carry the `caller` taint label, shown in the run's `input_labels`, so a write tool (or a read that reaches the network) their data reaches needs an `allow_tainted` entry such as `'caller'` or a human approval. Fields the node's input schema marks `x-caliban-untrusted` are untrusted whoever calls.
+
+  ```ts
+  const run = await caliban.runs.create('inbox-agent', {
+    input: { from: 'customer@example.com', email: { subject: 'Refund', body: emailText } },
+    untrusted: ['/email/body'],
+  });
+  console.log(run.input_labels); // ['caller']
+  ```
+- `async: true` answers at once with the pending run; poll `runs.get()` or follow `runs.events()`. `version` runs a published version other than the live one (`runs.list({ node, version })` filters by it); `budget` can only lower the version's budget for this run; `chat: { messages }` replaces `input` with chat messages.
 - A `RunEventStream` yields `RunEvent`s (`run.created`, `step.started`, `step.finished`, `run.input_required`, `run.sleeping`, `run.input_received`, `run.cancel_requested`, `run.finished`). The server ends it after `run.finished`, or after `run.input_required` while the run waits; that last event carries the run (`stream.run`, or `await stream.finalRun()`). Events never carry step content. `stream.runId` is the `Caliban-Run-Id` header. The timeout covers the time until headers arrive; the stream is not retried or resumed by itself: resume with `runs.events(runId, { after: stream.lastEventId })`.
 - `runs.input()` answers the step the run waits for (`awaiting.step`, or `step`). A step named `<step>@approve` asks to approve a write whose arguments carry untrusted taint labels: answer `{ approve: true }` or `{ approve: false }`. Not waiting for that step is a `409` (`run_not_awaiting_input`).
 - `runs.cancel()` cancels a waiting run at once and asks a running one to stop at its next step (`cancel_requested: true`); a run that already ended otherwise is a `409` (`run_already_ended`).
