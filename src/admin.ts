@@ -51,15 +51,14 @@ export type Health = Schemas['Health'];
 /** `NodeCreate` with `spec` typed against node.schema.json instead of a free-form object. */
 export type NodeCreate = Omit<Schemas['NodeCreate'], 'spec'> & { spec: NodeSpec };
 
-// ── Node evals (golden sets, promotion bar, evals, the gate) ──
-// The generator renders an object schema without properties as `Record<string, never>`; the
-// types below widen those spots (a check's JSON Schema, an eval's metrics, a trial's verdict,
-// the gate's problems) to `Record<string, unknown>`.
+// ── Node evals (golden sets, promotion bar, evals, the gate, the eval key) ──
 
 type ContractCheck = Schemas['EvalCheck'];
 /**
  * A check of a golden case's run output (contract: `EvalCheck`): `exact`, `contains`, `regex`,
- * `json_schema` or `llm_judge`. Text checks see the output as text (a string as is, other JSON compact).
+ * `json_schema` or `llm_judge`. Text checks see the output as text (a string as is, other JSON
+ * compact). The generator types the free-form `schema` of a `json_schema` check as
+ * `Record<string, never>`; here it is any JSON Schema object.
  */
 export type EvalCheck =
   | Exclude<ContractCheck, { type: 'json_schema' }>
@@ -74,46 +73,47 @@ export interface GoldenSetPut {
 }
 /** A node's promotion bar (contract: `EvalPolicy`). */
 export type EvalPolicy = Schemas['EvalPolicy'];
-/** Result of `evalPolicy.get()`: the bar, and `injection_bar`, the bar in effect for versions with write tools. */
-export type EvalPolicyInfo =
-  paths['/api/v1/tenants/{tenantId}/nodes/{nodeName}/eval-policy']['get']['responses'][200]['content']['application/json'];
-export type EvalSuite = Schemas['Eval']['suite'];
-export type EvalStatus = Schemas['Eval']['status'];
-type ContractTrial = NonNullable<Schemas['Eval']['trials']>[number];
-/** One trial of an eval: a case's run. `detail` only with `runs.data`. */
-export type EvalTrial = Omit<ContractTrial, 'verdict'> & { verdict?: Record<string, unknown> };
-/**
- * An eval of a node version (contract: `Eval`). `summary` holds metrics only (golden: `pass_hat_k`,
- * `pass_at_1`, `cost_per_success_usd`, `latency_ms`, ...; injection: `pass_rate`,
- * `attack_success_rate`, `by_category`, ...); `trials` only on `evals.get()`.
- */
-export type Eval = Omit<Schemas['Eval'], 'summary' | 'trials'> & {
-  summary?: Record<string, unknown> | null;
-  trials?: EvalTrial[];
-};
-type ContractEvalStart = NonNullable<
+/** The bar in effect (contract: `EvalPolicyView`); `injection_bar` applies to versions with write tools. */
+export type EvalPolicyView = Schemas['EvalPolicyView'];
+/** An eval of a node version (contract: `Eval`). `summary` (metrics only) is null until it ends; `trials` only on `evals.get()`. */
+export type Eval = Schemas['Eval'];
+export type EvalSuite = Eval['suite'];
+export type EvalStatus = Eval['status'];
+/** Golden metrics (contract: `GoldenSummary`): `pass_hat_k` (pass^k), `pass_at_1`, `cost_per_success_usd`, `latency_ms`, `by_case`, ... */
+export type GoldenSummary = Schemas['GoldenSummary'];
+/** Injection metrics (contract: `InjectionSummary`): `pass_rate`, `attack_success_rate`, `by_category`, `not_applicable`, ... */
+export type InjectionSummary = Schemas['InjectionSummary'];
+export type LatencyPercentiles = Schemas['LatencyPercentiles'];
+/** One trial of an eval: a case's run. `detail` only with `runs.data` (and until run retention purges it). */
+export type EvalTrial = NonNullable<Eval['trials']>[number];
+/** A golden trial's verdict: the run's status and each check's result. */
+export type GoldenVerdict = Schemas['GoldenVerdict'];
+/** An injection trial's verdict: category, whether the attack succeeded or was followed, the defenses that held. */
+export type InjectionVerdict = Schemas['InjectionVerdict'];
+/** Body of `evals.start()`. Without `api_key_id` the eval runs as the tenant's eval key (see `evalKey`). */
+export type EvalStart = NonNullable<
   paths['/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/evals']['post']['requestBody']
 >['content']['application/json'];
-/**
- * Body of `evals.start()`. `api_key_id` is optional here although the current contract requires
- * it: core is moving evals to a per-tenant eval key the control plane manages. Until a server
- * does, pass the id of an active API key of the tenant that may run the node (its quotas apply
- * and its usage is the eval's); a server that needs it and does not get one answers `422`.
- */
-export type EvalStart = Omit<ContractEvalStart, 'api_key_id'> & { api_key_id?: string };
 /** Query of `evals.list()`. `status` is comma separated. */
 export type EvalListQuery = NonNullable<
   paths['/api/v1/tenants/{tenantId}/evals']['get']['parameters']['query']
 >;
 /** A page of `evals.list()`; pass `next_cursor` as `cursor` for the next one (`null` on the last). */
-export type EvalList = Omit<
-  paths['/api/v1/tenants/{tenantId}/evals']['get']['responses'][200]['content']['application/json'],
-  'data'
-> & { data?: Eval[] };
-type ContractGate =
+export type EvalList =
+  paths['/api/v1/tenants/{tenantId}/evals']['get']['responses'][200]['content']['application/json'];
+/** The evals that met the bar, per suite, and per pinned subnode version under `subnodes` (contract: `GateEvidence`). */
+export type GateEvidence = Schemas['GateEvidence'];
+/** One reason a node version was refused (contract: `Problem`); `path` says where (a subnode for `eval_gate`). */
+export type Problem = Schemas['Problem'];
+/** What promoting a version would say: `allowed`, the `evidence`, or the `problems`. */
+export type EvalGate =
   paths['/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/gate']['get']['responses'][200]['content']['application/json'];
-/** What promoting a version would say: `allowed`, the evals that meet the bar (`evidence`), or the `problems`. */
-export type EvalGate = Omit<ContractGate, 'problems'> & { problems?: Record<string, unknown>[] };
+/** Result of `evalKey.get()`: the tenant's eval key (`key` is null before the first eval that names no key). */
+export type EvalKey =
+  paths['/api/v1/tenants/{tenantId}/eval-key']['get']['responses'][200]['content']['application/json'];
+/** Result of `evalKey.rotate()`: the new key and the id of the one it revoked. */
+export type EvalKeyRotation =
+  paths['/api/v1/tenants/{tenantId}/eval-key/rotate']['post']['responses'][200]['content']['application/json'];
 
 export const DEFAULT_CONTROL_PLANE_URL = 'http://localhost:8081';
 
@@ -255,7 +255,8 @@ export class CalibanAdmin {
     /**
      * Revoke a key (permanent). A standalone deployment rejects it on the next request; a
      * split-mode router rejects it after its next snapshot poll (10 s by default). Throws a 404
-     * `CalibanAPIError` if the key is unknown, belongs to another tenant or is already revoked.
+     * `CalibanAPIError` if the key is unknown, belongs to another tenant or is already revoked, and
+     * a 409 for the tenant's eval key (rotate that with `evalKey.rotate()`).
      */
     revoke: async (tenantId: string, keyId: string, opts?: AdminRequestOptions): Promise<void> => {
       await unwrap(
@@ -426,55 +427,47 @@ export class CalibanAdmin {
 
   /** A node's promotion bar: what its versions' evals must reach before a version is promoted. */
   readonly evalPolicy = {
-    get: (tenantId: string, nodeName: string, opts?: AdminRequestOptions): Promise<EvalPolicyInfo> =>
+    get: (tenantId: string, nodeName: string, opts?: AdminRequestOptions): Promise<EvalPolicyView> =>
       unwrap(
         this.raw.GET('/api/v1/tenants/{tenantId}/nodes/{nodeName}/eval-policy', {
           ...opts,
           params: { path: { tenantId, nodeName } },
         }),
       ),
-    /**
-     * Set the bar (`PUT`, needs `nodes.publish`; audited as `node.eval_policy.update`). Resolves to
-     * the stored bar as `get()` returns it, or `undefined` from a server that answers without a body
-     * (the contract does not promise one).
-     */
-    put: (
-      tenantId: string,
-      nodeName: string,
-      policy: EvalPolicy,
-      opts?: AdminRequestOptions,
-    ): Promise<EvalPolicyInfo | undefined> =>
+    /** Set the bar (`PUT`, needs `nodes.publish`; audited as `node.eval_policy.update`). Resolves to the bar now in effect. */
+    put: (tenantId: string, nodeName: string, policy: EvalPolicy, opts?: AdminRequestOptions): Promise<EvalPolicyView> =>
       unwrap(
         this.raw.PUT('/api/v1/tenants/{tenantId}/nodes/{nodeName}/eval-policy', {
           ...opts,
           params: { path: { tenantId, nodeName } },
           body: policy,
         }),
-      ) as Promise<EvalPolicyInfo | undefined>,
+      ),
   };
 
   /** Evals of published node versions: the golden suite (pass^k, cost per success) and the injection suite. */
   readonly evals = {
     /**
      * Start an eval of a published version (`202`; a version that is not published is a 409).
-     * Trials run as ordinary node runs on workers. See {@link EvalStart} for `api_key_id`.
+     * Trials run as ordinary node runs on workers, as the tenant's eval key unless `api_key_id`
+     * names an API key of the tenant (active, allowed to run the node).
      */
     start: (tenantId: string, nodeName: string, version: number, body: EvalStart, opts?: AdminRequestOptions): Promise<Eval> =>
       unwrap(
         this.raw.POST('/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/evals', {
           ...opts,
           params: { path: { tenantId, nodeName, version } },
-          body: body as ContractEvalStart,
+          body,
         }),
-      ) as Promise<Eval>,
+      ),
     /** The tenant's evals, newest first (metrics, never content). One page; follow `next_cursor`. */
     list: (tenantId: string, query: EvalListQuery = {}, opts?: AdminRequestOptions): Promise<EvalList> =>
-      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/evals', { ...opts, params: { path: { tenantId }, query } })) as Promise<EvalList>,
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/evals', { ...opts, params: { path: { tenantId }, query } })),
     /** An eval with its trials (each trial's `detail` only with `runs.data`). */
     get: (tenantId: string, evalId: string, opts?: AdminRequestOptions): Promise<Eval> =>
       unwrap(
         this.raw.GET('/api/v1/tenants/{tenantId}/evals/{evalId}', { ...opts, params: { path: { tenantId, evalId } } }),
-      ) as Promise<Eval>,
+      ),
     /** The trials of an eval (`get()` and its `trials`). */
     trials: async (tenantId: string, evalId: string, opts?: AdminRequestOptions): Promise<EvalTrial[]> =>
       (await this.evals.get(tenantId, evalId, opts)).trials ?? [],
@@ -485,7 +478,7 @@ export class CalibanAdmin {
     cancel: (tenantId: string, evalId: string, opts?: AdminRequestOptions): Promise<Eval> =>
       unwrap(
         this.raw.POST('/api/v1/tenants/{tenantId}/evals/{evalId}/cancel', { ...opts, params: { path: { tenantId, evalId } } }),
-      ) as Promise<Eval>,
+      ),
     /** What promoting the version would say against the node's promotion bar. */
     gate: (tenantId: string, nodeName: string, version: number, opts?: AdminRequestOptions): Promise<EvalGate> =>
       unwrap(
@@ -493,7 +486,24 @@ export class CalibanAdmin {
           ...opts,
           params: { path: { tenantId, nodeName, version } },
         }),
-      ) as Promise<EvalGate>,
+      ),
+  };
+
+  /**
+   * The tenant's eval key: an API key the control plane creates (on the first eval that names no
+   * key) and manages for the tenant's evals. Its plaintext is never returned; the data plane
+   * refuses it on its endpoints. `apiKeys.revoke()` on it is a 409: rotate it instead.
+   */
+  readonly evalKey = {
+    /** `key` is null before the tenant's first eval that names no key. */
+    get: (tenantId: string, opts?: AdminRequestOptions): Promise<EvalKey> =>
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/eval-key', { ...opts, params: { path: { tenantId } } })),
+    /**
+     * Revoke the eval key and create a new one (needs `api_keys.write`). Evals in flight lose
+     * their key: rotate between evals.
+     */
+    rotate: (tenantId: string, opts?: AdminRequestOptions): Promise<EvalKeyRotation> =>
+      unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/eval-key/rotate', { ...opts, params: { path: { tenantId } } })),
   };
 
   readonly usage = {

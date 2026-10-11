@@ -311,6 +311,7 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | `goldenSets` | `get`, `put`, `delete` (per node version) |
 | `evalPolicy` | `get`, `put` (per node: the promotion bar) |
 | `evals` | `start`, `list`, `get`, `trials`, `cancel`, `gate` |
+| `evalKey` | `get`, `rotate` (the tenant's eval key) |
 | `usage` | `get` |
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
@@ -353,12 +354,12 @@ Tenants from an older server omit the fields it does not know, so they are `unde
 | `cache_tier` | Cache hits | `'exact'` or `'semantic'`. `cache` stays `hit`, `miss` or `bypass`. |
 | `tokens_saved` | Cache hits | Tokens not sent upstream: the cached answer's prompt plus completion tokens. |
 | `requested_model` | Chat requests | The model the client asked for: `caliban/auto` or a pinned id. |
-| `intent_confidence` | Chat requests | Confidence of the intent decision, 0..1. |
-| `route_stage` | Chat requests | `'rules'`, `'knn'` or `'keyword'`. |
 | `routed_model_cost_usd` | `caliban/auto`, priced model | Real cost of the routed model for this request. |
 | `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
 | `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` x the tenant's cache-hit fraction on a hit. |
 | `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
+
+**Routing decisions are content-class**: which intent a request went to reveals its topic, so reports never carry them. `intent` is empty and `intent_confidence`, `route_stage`, `route` and `route_fallback` are absent on reported events (they exist only in transit between a data plane and the control plane). `by_route` counts requests per tenant, UTC day, intent, deciding stage and fallback reason instead (empty strings: not set); it is not computed when you filter by `node` or `run_id`. The `x-caliban-intent` response header still tells the caller of a request how it was routed.
 
 `totals` adds `charged_usd` (what the customer is charged: the billed `caliban/auto` price, the model's cost otherwise; over a run's events it equals the run's `cost_usd`), `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
@@ -396,16 +397,22 @@ await admin.goldenSets.put(t, 'desk', 2, {
 await admin.evalPolicy.put(t, 'desk', { golden: { min_pass_k: 0.9, min_k: 3 }, injection: { min_pass_rate: 1 } });
 
 // 3. Evaluate the published version, then follow it.
-const ev = await admin.evals.start(t, 'desk', 2, { suite: 'golden', k: 3, api_key_id: keyId });
-const done = await admin.evals.get(t, ev.id); // status, summary (metrics only) and trials
-console.log(done.status, done.summary?.pass_hat_k, done.summary?.cost_per_success_usd);
+const ev = await admin.evals.start(t, 'desk', 2, { suite: 'golden', k: 3 }); // runs as the tenant's eval key
+const done = await admin.evals.get(t, ev.id); // status, summary (metrics only, null until it ends) and trials
+if (done.summary?.suite === 'golden') {
+  console.log(done.summary.pass_hat_k, done.summary.cost_per_success_usd, done.summary.latency_ms.p95);
+} else if (done.summary?.suite === 'injection') {
+  console.log(done.summary.pass_rate, done.summary.by_category, done.summary.not_applicable);
+}
 
 // 4. Would promotion pass?
 const gate = await admin.evals.gate(t, 'desk', 2);
-if (!gate.allowed) console.log(gate.problems);
+if (!gate.allowed) console.log(gate.problems); // Problem[]: kind eval_gate, path names a failing subnode
+else console.log(gate.evidence);                 // GateEvidence: golden, injection, subnodes
 ```
 
-- **`api_key_id` is optional in the SDK.** The current contract requires it: trials run as the tenant API key it names (it must be active and allowed to run the node; its quotas apply and its usage is the eval's). Core is moving evals to a per-tenant eval key the control plane manages; with such a server, leave it out. A server that still needs it answers `422` without it.
+- **The eval key.** Without `api_key_id`, trials and judge calls run as the tenant's eval key: an API key the control plane creates on the first such eval and manages (`purpose: 'eval'`). Its quotas apply and its usage is the eval's. `evalKey.get(tenantId)` shows it (`key` is `null` before that first eval; the plaintext is never returned, and the data plane refuses it on its endpoints); `evalKey.rotate(tenantId)` revokes it and creates a new one (`revoked` is the old id), so rotate between evals: evals in flight lose their key. `apiKeys.revoke()` on the eval key is a `409`. Pass `api_key_id` to run an eval as one of the tenant's own keys instead (active, allowed to run the node).
+- `summary` and each trial's `verdict` follow the eval's suite: narrow on `summary.suite` (`GoldenSummary` or `InjectionSummary`); a verdict is a `GoldenVerdict` (run status and each check's result), an `InjectionVerdict` (category, `succeeded`, `attacked`, the defenses that held) or `{ error }` when the trial's run could not be created. Run retention purges trial `detail` (`content_purged: true`); summaries and verdicts stay.
 - `evals.list(tenantId, { node, version, suite, status, limit, cursor })` returns one page (`data`, `next_cursor`), newest first, metrics and never content. `evals.trials(tenantId, evalId)` is `evals.get()` and its `trials`; each trial's `detail` (outputs, what the scorers said) is only there when the caller holds `runs.data`, and so are golden set `cases` (`content_visible`).
 - `evals.cancel()` ends a pending eval at once and asks a running one to stop (`cancel_requested: true`); an eval that already ended throws a `409`.
 - `goldenSets.put()` and `evalPolicy.put()` are `PUT`s, retried like a GET. `evals.start()` is a POST: retried on 429 and 503 only, unless you pass an `Idempotency-Key` header.
@@ -486,7 +493,8 @@ export const invoiceTriage = defineNode({
   tools: [
     { ref: 'mcp://erp/lookup_invoice#sha256:<hash>', effect: 'read' },
     { ref: 'builtin://datasource_query', effect: 'read' },
-    // A write whose arguments may carry these taint labels without a human approval.
+    // A write (or a read that reaches the network through its arguments) whose arguments may
+    // carry these taint labels without a human approval: tool:<server>/*, datasource, caller, *.
     { ref: 'mcp://erp/flag_invoice#sha256:<hash>', effect: 'write', allow_tainted: ['datasource'] },
   ],
   datasources: { scopes: ['erp.invoices:read'] },
@@ -499,6 +507,8 @@ export const invoiceTriage = defineNode({
 
 await new CalibanAdmin().nodes.create({ tenant_id: 't_1', name: 'invoice-triage', spec: invoiceTriage });
 ```
+
+Mark the fields of `prompt.input_schema` that hold untrusted data (an email body, a web page) with `'x-caliban-untrusted': true` on the property, its `items` or the whole schema: whoever calls, their values make the run input carry the `caller` taint label, so a write their data reaches needs an `allow_tainted` entry or a human approval. A caller can mark more with `untrusted` on `runs.create()`, never less.
 
 A workflow (`kind: 'workflow'`) declares a `graph` of vertices and edges instead; `graph.entry` names the vertex a run starts at (default: the first). The helper types `NodePrompt`, `NodeTool`, `NodeToolRef`, `NodeModelPolicy`, `NodeGuardrails`, `NodeAgent`, `NodeBudgets`, `NodeGuards`, `NodeGraph`, `NodeVertex` and `NodeEdge` name the parts of a spec.
 

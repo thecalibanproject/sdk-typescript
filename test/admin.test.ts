@@ -8,11 +8,16 @@ import {
   type EvalCheck,
   type EvalGate,
   type EvalPolicy,
+  type EvalPolicyView,
   type EvalStart,
   type EvalStatus,
   type EvalSuite,
   type EvalTrial,
   type GoldenCase,
+  type GoldenSummary,
+  type GoldenVerdict,
+  type InjectionVerdict,
+  type Problem,
 } from '../src/index.js';
 import { fastRetry, json, mockFetch } from './helpers.js';
 
@@ -405,25 +410,23 @@ describe('CalibanAdmin node evals', () => {
       injection: { min_pass_rate: 1 },
     };
     const view = { object: 'node.eval_policy', node: 'desk', policy, injection_bar: 1, updated_at: 'x', updated_by: 'u' };
-    const m = mockFetch(json(view), json(view), new Response(null, { status: 200 }));
+    const m = mockFetch(json(view), json(view));
     const a = admin(m.fetch);
     expect((await a.evalPolicy.get('t_1', 'desk')).injection_bar).toBe(1);
     expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${N}/eval-policy` });
-    expect((await a.evalPolicy.put('t_1', 'desk', policy))?.policy).toEqual(policy);
+    expect((await a.evalPolicy.put('t_1', 'desk', policy)).policy).toEqual(policy);
     expect(m.calls[1]).toMatchObject({ method: 'PUT', url: `${N}/eval-policy` });
     expect(JSON.parse(m.calls[1]!.body!)).toEqual(policy);
-    // A server that answers without a body.
-    await expect(a.evalPolicy.put('t_1', 'desk', policy)).resolves.toBeUndefined();
   });
 
-  it('starts an eval with or without api_key_id', async () => {
+  it('starts an eval as the eval key or a named api key', async () => {
     const m = mockFetch(json(evalBody, { status: 202 }));
     const a = admin(m.fetch);
     const started = await a.evals.start('t_1', 'desk', 2, { suite: 'golden', api_key_id: 'k1', k: 3, judge_model: 'local/qwen3-8b' });
     expect(started.status).toBe('pending');
     expect(m.calls[0]).toMatchObject({ method: 'POST', url: `${N}/versions/2/evals` });
     expect(JSON.parse(m.calls[0]!.body!)).toEqual({ suite: 'golden', api_key_id: 'k1', k: 3, judge_model: 'local/qwen3-8b' });
-    // A server with a managed eval key does not need one.
+    // Without api_key_id the eval runs as the tenant's eval key.
     await a.evals.start('t_1', 'desk', 2, { suite: 'injection', input_case: 'chest' });
     expect(JSON.parse(m.calls[1]!.body!)).toEqual({ suite: 'injection', input_case: 'chest' });
   });
@@ -435,10 +438,28 @@ describe('CalibanAdmin node evals', () => {
   });
 
   it('lists, gets, cancels evals and reads trials', async () => {
-    const trial = { case: 'chest', trial: 0, run_id: 'run_1', status: 'passed', cost_usd: 0.001, verdict: { checks: 3 } };
+    const verdict: GoldenVerdict = { run_status: 'succeeded', checks: [{ type: 'contains', passed: true }, { type: 'llm_judge', passed: true, score: 0.9 }] };
+    const trial = { case: 'chest', trial: 0, run_id: 'run_1', status: 'passed', cost_usd: 0.001, verdict };
+    const summary: GoldenSummary = {
+      suite: 'golden',
+      k: 3,
+      cases: 2,
+      trials: 6,
+      passed_trials: 6,
+      errors: 0,
+      pass_hat_k: 1,
+      pass_at_1: 1,
+      pass_at_k: 1,
+      cost_usd: 0.006,
+      cost_per_success_usd: 0.001,
+      judge_cost_usd: 0.0005,
+      tokens: 900,
+      latency_ms: { p50: 800, p95: 1200 },
+      by_case: [{ case: 'chest', trials: 3, passed: 3, all_passed: true }],
+    };
     const m = mockFetch(
       json({ object: 'list', data: [evalBody], next_cursor: 'c2' }),
-      json({ ...evalBody, status: 'succeeded', summary: { pass_hat_k: 1 }, trials: [trial] }),
+      json({ ...evalBody, status: 'succeeded', summary, trials: [trial] }),
       json({ ...evalBody, trials: [trial] }),
       json({ ...evalBody, status: 'running', cancel_requested: true }, { status: 202 }),
       json({ error: { message: 'eval ended', type: 'conflict', code: 'eval_already_ended' } }, { status: 409 }),
@@ -450,7 +471,10 @@ describe('CalibanAdmin node evals', () => {
       'http://cp:8081/api/v1/tenants/t_1/evals?node=desk&version=2&suite=golden&status=succeeded%2Cfailed&limit=10&cursor=c1',
     );
     const ev = await a.evals.get('t_1', 'ev_1');
-    expect(ev.summary?.pass_hat_k).toBe(1);
+    // `summary` follows `suite`: narrow on its own `suite` field.
+    if (ev.summary?.suite !== 'golden') throw new Error('expected a golden summary');
+    expect(ev.summary.pass_hat_k).toBe(1);
+    expect(ev.summary.latency_ms.p95).toBe(1200);
     expect(m.calls[1]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/tenants/t_1/evals/ev_1' });
     expect(await a.evals.trials('t_1', 'ev_1')).toEqual([trial]);
     const cancelled = await a.evals.cancel('t_1', 'ev_1');
@@ -461,23 +485,60 @@ describe('CalibanAdmin node evals', () => {
 
   it('asks the gate', async () => {
     const m = mockFetch(
-      json({ node: 'desk', version: 2, has_write_tools: true, allowed: false, evidence: null, problems: [{ kind: 'eval_gate', message: 'no injection eval' }] }),
+      json({
+        node: 'desk',
+        version: 2,
+        has_write_tools: true,
+        allowed: false,
+        evidence: null,
+        problems: [{ kind: 'eval_gate', message: 'kb@v1 has no injection eval', path: 'node://kb@v1' }],
+      }),
+      json({
+        node: 'desk',
+        version: 3,
+        has_write_tools: true,
+        allowed: true,
+        evidence: { golden: { eval: 'ev_1', k: 3, pass_hat_k: 0.95 }, injection: { eval: 'ev_2', pass_rate: 1, bar: 1 }, subnodes: { 'kb@v1': null } },
+        problems: [],
+      }),
     );
-    const gate = await admin(m.fetch).evals.gate('t_1', 'desk', 2);
+    const a = admin(m.fetch);
+    const gate = await a.evals.gate('t_1', 'desk', 2);
     expect(gate.allowed).toBe(false);
-    expect(gate.problems?.[0]?.kind).toBe('eval_gate');
+    expect(gate.problems?.[0]).toEqual({ kind: 'eval_gate', message: 'kb@v1 has no injection eval', path: 'node://kb@v1' });
+    const ok = await a.evals.gate('t_1', 'desk', 3);
+    expect(ok.evidence?.injection?.pass_rate).toBe(1);
+    expect(ok.evidence?.subnodes?.['kb@v1']).toBeNull();
     expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${N}/versions/2/gate` });
   });
 
-  it('types follow the contract, with api_key_id optional', () => {
+  it('reads and rotates the tenant eval key', async () => {
+    const key = { id: 'k_eval', name: 'eval', prefix: 'cal_ev12', created_at: 'x', purpose: 'eval' };
+    const m = mockFetch(
+      json({ tenant_id: 't_1', key: null }),
+      json({ tenant_id: 't_1', key, revoked: 'k_old' }),
+      json({ error: { message: 'the eval key is managed by the control plane', type: 'conflict' } }, { status: 409 }),
+    );
+    const a = admin(m.fetch);
+    expect((await a.evalKey.get('t_1')).key).toBeNull();
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/tenants/t_1/eval-key' });
+    const rotated = await a.evalKey.rotate('t_1');
+    expect(rotated.key.purpose).toBe('eval');
+    expect(rotated.revoked).toBe('k_old');
+    expect(m.calls[1]).toMatchObject({ method: 'POST', url: 'http://cp:8081/api/v1/tenants/t_1/eval-key/rotate' });
+    await expect(a.apiKeys.revoke('t_1', 'k_eval')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('types follow the contract', () => {
     expectTypeOf<EvalStart['api_key_id']>().toEqualTypeOf<string | undefined>();
     expectTypeOf<EvalStart['suite']>().toEqualTypeOf<EvalSuite>();
     expectTypeOf<EvalSuite>().toEqualTypeOf<'golden' | 'injection'>();
     expectTypeOf<EvalStatus>().toEqualTypeOf<'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'>();
     expectTypeOf<Extract<EvalCheck, { type: 'json_schema' }>['schema']>().toEqualTypeOf<Record<string, unknown>>();
-    expectTypeOf<Eval['summary']>().toEqualTypeOf<Record<string, unknown> | null | undefined>();
-    expectTypeOf<NonNullable<EvalTrial['verdict']>>().toEqualTypeOf<Record<string, unknown>>();
-    expectTypeOf<NonNullable<EvalGate['problems']>>().toEqualTypeOf<Record<string, unknown>[]>();
+    expectTypeOf<Extract<NonNullable<Eval['summary']>, { suite: 'golden' }>>().toEqualTypeOf<GoldenSummary>();
+    expectTypeOf<NonNullable<EvalTrial['verdict']>>().toEqualTypeOf<GoldenVerdict | InjectionVerdict | { error: string }>();
+    expectTypeOf<NonNullable<EvalGate['problems']>>().toEqualTypeOf<Problem[]>();
+    expectTypeOf<Awaited<ReturnType<CalibanAdmin['evalPolicy']['put']>>>().toEqualTypeOf<EvalPolicyView>();
     // @ts-expect-error a check needs a known type
     const bad: EvalCheck = { type: 'similar', value: 'x' };
     expect(bad).toBeDefined();

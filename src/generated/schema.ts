@@ -414,6 +414,13 @@ export interface paths {
          *     Instead of `input`, `chat.messages` gives chat messages, mapped to the node's input as the
          *     `node/<name>` chat shortcut does.
          *
+         *     **Untrusted caller data** (`untrusted`): `true` marks the whole input, a list of JSON
+         *     pointers marks fields (`["/email/body"]`). Marked values that are present (and the fields
+         *     the node's input schema declares `x-caliban-untrusted: true`, whoever calls) make the run
+         *     input carry the `caller` taint label: a write tool their data reaches needs an
+         *     `allow_tainted` entry or a human approval, as with tool outputs. Unmarked input is trusted
+         *     (the API key that may run the node is the principal). See core/docs/tools.md.
+         *
          *     Every model call the run makes goes through the gateway pipeline as the invoking key (PII,
          *     caches, routing, quotas, metering), with an Idempotency-Key per step. Split-mode routers
          *     forward this request to a worker.
@@ -456,6 +463,8 @@ export interface paths {
                             usd?: number;
                             wall_clock_s?: number;
                         };
+                        /** @description Input the caller marks as untrusted data (taint label `caller`): `true` (all of it), `false`, or JSON pointers into the input (`""` is the whole input) */
+                        untrusted?: boolean | string[];
                     };
                 };
             };
@@ -513,6 +522,8 @@ export interface paths {
             parameters: {
                 query?: {
                     node?: string;
+                    /** @description Only runs of this version (with `node`: that node's version) */
+                    version?: number;
                     /** @description Comma-separated run statuses */
                     status?: string;
                     created_after?: string;
@@ -677,7 +688,9 @@ export interface paths {
          *     otherwise). `tools/list`: the published nodes the key may run (input schema: the node's).
          *     `tools/call`: runs the node, waits at most `CALIBAN_NODE_SYNC_WAIT_SECS`. With
          *     `CALIBAN_MCP_TASKS=true`, clients declaring the tasks extension get a task (its id is the run
-         *     id) and use `tasks/get`, `tasks/update`, `tasks/cancel`. See core/docs/nodes.md.
+         *     id) and use `tasks/get`, `tasks/update`, `tasks/cancel`. `params._meta["caliban/untrusted"]`
+         *     on `tools/call` (`true`, or JSON pointers into the arguments) marks arguments as untrusted
+         *     caller data, like `untrusted` on `POST /v1/nodes/{name}/runs`. See core/docs/nodes.md.
          */
         post: {
             parameters: {
@@ -1166,6 +1179,15 @@ export interface paths {
                     content?: never;
                 };
                 404: components["responses"]["Error"];
+                /** @description The tenant's eval key: managed by the control plane (rotate it with `POST .../eval-key/rotate`) */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
             };
         };
         options?: never;
@@ -1378,6 +1400,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tenantId}/runs/{runId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                runId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a run (console)
+         * @description As the signed-in user (permission `runs.answer`: whoever may deny a write, which fails the
+         *     run, may stop it). Audited once as `node.run.cancel`. A waiting run (pending, sleeping,
+         *     input required) ends at once (`200`); a running run is asked to stop and its worker stops
+         *     at the next step boundary (`202`); a run already cancelled is a `200`; a run that ended
+         *     otherwise is a `409` (`run_already_ended`).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Cancelled */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ConsoleRun"];
+                    };
+                };
+                /** @description Asked to stop */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ConsoleRun"];
+                    };
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tenantId}/inbox": {
         parameters: {
             query?: never;
@@ -1429,6 +1513,17 @@ export interface paths {
                                  * @description When the human step times out (its `timeout_s`)
                                  */
                                 expires_at?: string | null;
+                                /** @description `kind: approval` only: what the gated call would do, structured (the `question` text says the same). `arguments` with `runs.data` only. Null for runs from a worker that recorded none. */
+                                approval?: {
+                                    /** @description The tool reference (`mcp://server/tool#sha256:...`) */
+                                    tool?: string;
+                                    /** @description `write`, or `read, reaches the network through its arguments` */
+                                    effect?: string;
+                                    /** @description The untrusted taint labels its arguments carry */
+                                    labels?: string[];
+                                    /** @description With `runs.data`: the arguments it would be called with */
+                                    arguments?: unknown;
+                                } | null;
                             }[];
                         };
                     };
@@ -1887,8 +1982,9 @@ export interface paths {
          *     runs). Its budgets are checked against the tenant's current `node_caps` (422). The node's
          *     promotion bar must be met by the version's latest finished evals (422, problems of kind
          *     `eval_gate`): the golden bar when the node sets one, and for a version with write tools
-         *     always an injection eval (default bar: every attack blocked). A draft or a retired version
-         *     is a 409. Needs `nodes.publish`; audited as `node.promote` with the previous live version
+         *     always an injection eval (default bar: every attack blocked). Every `node://` subnode version
+         *     it pins (down the tree) must pass its own gate too (problem `path`: `node://<child>@v<N>`;
+         *     evidence under `subnodes`). A draft or a retired version is a 409. Needs `nodes.publish`; audited as `node.promote` with the previous live version
          *     and the evals that met the bar (`evals`).
          */
         post: {
@@ -2144,16 +2240,7 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": {
-                            /** @enum {string} */
-                            object?: "node.eval_policy";
-                            node?: string;
-                            policy?: components["schemas"]["EvalPolicy"];
-                            injection_bar?: number;
-                            /** Format: date-time */
-                            updated_at?: string | null;
-                            updated_by?: string | null;
-                        };
+                        "application/json": components["schemas"]["EvalPolicyView"];
                     };
                 };
             };
@@ -2178,12 +2265,14 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Stored */
+                /** @description Stored; the bar now in effect */
                 200: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["EvalPolicyView"];
+                    };
                 };
                 422: components["responses"]["Error"];
             };
@@ -2211,8 +2300,10 @@ export interface paths {
         /**
          * Start an eval of a published version
          * @description `golden`: every case of the version's golden set (or `cases`) runs `k` times (default 3) as
-         *     ordinary node runs on workers, through the request pipeline, as the API key `api_key_id`
-         *     (it must be active and allowed to run the node; its quotas apply and its usage is metered).
+         *     ordinary node runs on workers, through the request pipeline, as the tenant's eval key (created
+         *     and managed by the control plane, see `GET .../eval-key`), or as the API key `api_key_id`
+         *     when one is named (it must be active and allowed to run the node). The key's quotas apply and
+         *     its usage is metered.
          *     `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
          *     input is `input`, else the input of `input_case` (or the golden set's first case), whose
          *     checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
@@ -2234,7 +2325,8 @@ export interface paths {
                     "application/json": {
                         /** @enum {string} */
                         suite: "golden" | "injection";
-                        api_key_id: string;
+                        /** @description Optional: a customer API key to run the eval as. Absent: the tenant's eval key */
+                        api_key_id?: string;
                         k?: number;
                         /** @default 4 */
                         concurrency?: number;
@@ -2310,9 +2402,10 @@ export interface paths {
                             version?: number;
                             has_write_tools?: boolean;
                             allowed?: boolean;
-                            /** @description The evals that meet the bar (`golden`, `injection`), null when no gate applies */
-                            evidence?: unknown;
-                            problems?: Record<string, never>[];
+                            /** @description The evals that meet the bar; null when no gate applies */
+                            evidence?: components["schemas"]["GateEvidence"] | null;
+                            /** @description Every reason it cannot be promoted (kind `eval_gate`; `path` names a subnode whose own gate failed) */
+                            problems?: components["schemas"]["Problem"][];
                         };
                     };
                 };
@@ -2320,6 +2413,107 @@ export interface paths {
         };
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/eval-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The tenant's eval key
+         * @description `api_keys.read`. The API key the control plane creates and manages for the tenant's evals
+         *     (on the first eval that names no key). Its plaintext never exists outside the moment it is
+         *     generated; the data plane refuses it on its endpoints (`401`); workers use it for eval runs
+         *     and judge calls, which are metered and limited as this key. `key` is null before the first
+         *     eval. Revoked with the tenant.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tenant_id: string;
+                            key: components["schemas"]["ApiKeyInfo"] | null;
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/eval-key/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate the tenant's eval key
+         * @description `api_keys.write`. Revokes the eval key (`api_key.revoke`) and creates a new one
+         *     (`api_key.create`, `purpose: eval`). Evals in flight lose their key: rotate between evals.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Rotated */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tenant_id: string;
+                            key: components["schemas"]["ApiKeyInfo"];
+                            /** @description The id of the key it replaced */
+                            revoked: string | null;
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
@@ -3459,7 +3653,10 @@ export interface paths {
          * Approve a manifest by pin (tools.approve)
          * @description Only approved manifests reach the data plane and can be pinned by a published node version. A manifest
          *     with scan findings needs `acknowledge_findings: true` (`422` otherwise). Audited (`tool.approve`, with the
-         *     findings and the acknowledgement).
+         *     findings, the acknowledgement and the network decision). `network` records whether the tool reaches the
+         *     network through its arguments (a URL, a host): a read through such a tool is gated like a write (tainted
+         *     arguments need an `allow_tainted` entry or a human approval). Absent: the input schema's hints decide
+         *     (`network_hint` on the manifest). To change it, revoke and approve again.
          */
         post: {
             parameters: {
@@ -3479,6 +3676,8 @@ export interface paths {
                         pin: string;
                         /** @default false */
                         acknowledge_findings?: boolean;
+                        /** @description The tool reaches the network through its arguments (overrides the schema hints) */
+                        network?: boolean;
                     };
                 };
             };
@@ -3625,6 +3824,11 @@ export interface paths {
          *     totals each node version (cost per node); a `run_id` covers raw events only. `from` and `to`
          *     limit the events, the totals and `by_node` to `from <= ts < to`; a rolled-up day counts when its
          *     start (00:00 UTC) is in the range.
+         *
+         *     **Routing decisions are content-class** (which intent requests go to reveals topics, arXiv
+         *     2610.09981): events come without `intent`, `intent_confidence`, `route_stage`, `route` and
+         *     `route_fallback` (empty or absent), and `by_route` counts requests per tenant, UTC day, intent,
+         *     deciding stage and fallback reason instead (not with `node` or `run_id`).
          */
         get: {
             parameters: {
@@ -4468,14 +4672,18 @@ export interface components {
                 /** @description For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`). */
                 code?: string | null;
                 /** @description Node version refusals (`422`, `validation_failed`): every reason, one by one, next to `message` (which joins them). */
-                problems?: {
-                    /** @enum {string} */
-                    kind: "spec" | "tool" | "datasource_scope" | "budget" | "node_ref" | "cycle" | "eval_gate" | "golden_set";
-                    message: string;
-                    /** @description Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2` */
-                    path?: string;
-                }[];
+                problems?: components["schemas"]["Problem"][];
             };
+        };
+        Problem: {
+            /**
+             * @description `allowlist` appears in `warnings` only
+             * @enum {string}
+             */
+            kind: "spec" | "tool" | "datasource_scope" | "budget" | "node_ref" | "cycle" | "eval_gate" | "golden_set" | "allowlist";
+            message: string;
+            /** @description Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2` (for `eval_gate`: the subnode whose own gate failed) */
+            path?: string;
         };
         Health: {
             /** @enum {string} */
@@ -4514,6 +4722,8 @@ export interface components {
             /** @default false */
             zdr?: boolean;
             trace_id?: string;
+            /** @description `model: "node/<name>"` (and caliban/auto handing the request to a node): the node input the caller marks as untrusted data (taint label `caller`), `true` or JSON pointers into the node's input. See `POST /v1/nodes/{name}/runs`. */
+            untrusted?: boolean | string[];
         };
         ChatMessage: {
             /** @enum {string} */
@@ -4751,6 +4961,11 @@ export interface components {
             nodes?: string[] | null;
             /** @description Datasource scopes the built-in query tool may read for this key (absent: every scope of the nodes it runs). */
             datasource_scopes?: string[];
+            /**
+             * @description `eval`: the tenant's eval key, managed by the control plane (absent on keys customers create)
+             * @enum {string}
+             */
+            purpose?: "eval";
         };
         ApiKeyCreated: components["schemas"]["ApiKeyInfo"] & {
             /** @description Plaintext key. Shown once. */
@@ -5041,6 +5256,134 @@ export interface components {
                 min_pass_rate: number;
             };
         };
+        EvalPolicyView: {
+            /** @enum {string} */
+            object: "node.eval_policy";
+            node: string;
+            policy: components["schemas"]["EvalPolicy"];
+            /** @description The injection bar in effect for versions with write tools (default 1) */
+            injection_bar: number;
+            /** Format: date-time */
+            updated_at?: string | null;
+            updated_by?: string | null;
+        };
+        /** @description The evals that met the bar (in the audit entries `node.publish` and `node.promote` as `evals`) */
+        GateEvidence: {
+            golden?: {
+                eval: string;
+                k: number;
+                pass_hat_k: number;
+            };
+            injection?: {
+                eval: string;
+                pass_rate: number;
+                bar: number;
+            };
+            /** @description Per pinned subnode version (`name@vN`): its own evidence, or null when no gate applies to it */
+            subnodes?: {
+                [key: string]: components["schemas"]["GateEvidence"] | null;
+            };
+        };
+        LatencyPercentiles: {
+            /** @description Nearest rank, ms */
+            p50: number | null;
+            p95: number | null;
+        };
+        GoldenSummary: {
+            /** @enum {string} */
+            suite: "golden";
+            k: number;
+            cases: number;
+            trials: number;
+            passed_trials: number;
+            errors: number;
+            /** @description pass^k: the share of cases whose k runs all passed */
+            pass_hat_k: number;
+            pass_at_1: number;
+            pass_at_k: number;
+            cost_usd: number;
+            cost_per_success_usd?: number | null;
+            judge_cost_usd: number;
+            tokens: number;
+            latency_ms: components["schemas"]["LatencyPercentiles"];
+            by_case: {
+                case: string;
+                trials: number;
+                passed: number;
+                all_passed: boolean;
+            }[];
+            golden_hash?: string;
+            judge?: {
+                default_model?: string;
+                prompt_version?: number;
+                prompt_sha256?: string;
+                temperature?: number;
+            };
+        };
+        InjectionSummary: {
+            /** @enum {string} */
+            suite: "injection";
+            suite_version: number;
+            trials: number;
+            blocked: number;
+            /** @description Share of attacks blocked */
+            pass_rate: number;
+            attack_success_rate: number;
+            attacks_succeeded: number;
+            errors: number;
+            /** @description Trials where the model followed the injection */
+            attacked: number;
+            /** @description Share of runs that still did their job */
+            utility_under_attack: number;
+            by_category: {
+                [key: string]: {
+                    trials: number;
+                    blocked: number;
+                    pass_rate: number;
+                };
+            };
+            /** @description Cases this version offers no surface for, with why */
+            not_applicable: {
+                case: string;
+                reason: string;
+            }[];
+            cost_usd: number;
+            latency_ms: components["schemas"]["LatencyPercentiles"];
+            cases: {
+                case: string;
+                trial: number;
+                blocked: boolean;
+                attacked?: boolean | null;
+                defenses?: string[] | null;
+                run_id?: string | null;
+            }[];
+        };
+        GoldenVerdict: {
+            run_status: components["schemas"]["RunStatus"];
+            checks: {
+                /** @enum {string} */
+                type: "exact" | "contains" | "regex" | "json_schema" | "llm_judge";
+                passed: boolean;
+                /** @description The judge's score (llm_judge) */
+                score?: number | null;
+            }[];
+            judge_usd?: number;
+        };
+        InjectionVerdict: {
+            case: string;
+            /** @enum {string} */
+            category: "tainted_write" | "exfiltration" | "pii_leak" | "tool_poisoning" | "replay" | "subnode" | "caller_data";
+            /** @description The attack reached its goal */
+            succeeded: boolean;
+            /** @description The model followed the injection */
+            attacked: boolean;
+            defenses: ("approval_required" | "pii_guard" | "declared_tools_only" | "manifest_scan")[];
+            /** @description Sandboxed calls of the run */
+            tool_calls: number;
+            /** @description The run still did its job (absent for the manifest scan) */
+            utility?: boolean;
+            run_status?: components["schemas"]["RunStatus"];
+        };
         Eval: {
             id: string;
             /** @enum {string} */
@@ -5057,21 +5400,14 @@ export interface components {
             status: "pending" | "running" | "succeeded" | "failed" | "cancelled";
             created_by?: string;
             api_key_id?: string | null;
-            /**
-             * @description Metrics only. Golden: `k`, `cases`, `trials`, `passed_trials`, `errors`, `pass_hat_k`
-             *     (pass^k), `pass_at_1`, `pass_at_k`, `cost_usd`, `cost_per_success_usd`,
-             *     `judge_cost_usd`, `tokens`, `latency_ms` (`p50`, `p95`), `by_case`, `golden_hash`,
-             *     `judge` (default model, prompt version and hash, temperature). Injection:
-             *     `suite_version`, `trials`, `blocked`, `pass_rate`, `attack_success_rate`,
-             *     `attacks_succeeded`, `attacked` (the model followed the injection),
-             *     `utility_under_attack`, `by_category`, `not_applicable` (`case`, `reason`), `cases`,
-             *     `cost_usd`, `latency_ms`.
-             */
-            summary?: Record<string, never> | null;
+            /** @description Metrics only, never content; null until the eval ends. The shape follows `suite`. */
+            summary?: components["schemas"]["GoldenSummary"] | components["schemas"]["InjectionSummary"] | null;
             error?: string | null;
             cancel_requested?: boolean;
             cancelled_by?: string | null;
             claims?: number;
+            /** @description Run retention cleared the eval's sealed content (trial `detail`, the plan); the summary and verdicts stay */
+            content_purged?: boolean;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -5088,8 +5424,10 @@ export interface components {
                 cost_usd?: number;
                 latency_ms?: number;
                 tokens?: number;
-                /** @description Metadata: checks passed (golden); category, attacked, succeeded, defenses, utility (injection) */
-                verdict?: Record<string, never>;
+                /** @description Metadata, never content. The shape follows the eval's suite; `{"error"}` when the trial's run could not be created. */
+                verdict?: components["schemas"]["GoldenVerdict"] | components["schemas"]["InjectionVerdict"] | {
+                    error: string;
+                };
                 /** @description With runs.data only: the output and what the scorers said, or what the sandboxed tools received */
                 detail?: unknown;
                 /** Format: date-time */
@@ -5142,8 +5480,10 @@ export interface components {
             steps: components["schemas"]["RunStep"][];
             /** @description How many times a worker claimed the run (more than 1 after a takeover or a resume) */
             claims?: number;
-            /** @description What started the run when not a run request: `auto:<intent>` (caliban/auto) */
+            /** @description What started the run when not a run request: `auto` (caliban/auto; the intent is not recorded with the run) */
             origin?: string;
+            /** @description Taint labels the run input carries from the start: `caller` when it holds untrusted caller data */
+            input_labels?: string[];
             /** @description A cancellation was asked for and the run has not stopped yet */
             cancel_requested?: boolean;
             /** @description Number of the run's last event (resume its event stream after it) */
@@ -5258,6 +5598,8 @@ export interface components {
             status: components["schemas"]["RunStatus"];
             invoker?: string;
             origin?: string | null;
+            /** @description Taint labels the run input carries from the start (`caller`) */
+            input_labels?: string[];
             error?: string | null;
             stop_reason?: string | null;
             partial?: boolean;
@@ -5363,6 +5705,10 @@ export interface components {
             approved_at: string | null;
             approved_by: string | null;
             findings_acknowledged: boolean;
+            /** @description The approver's decision: the tool reaches the network through its arguments (null: none given) */
+            network?: boolean | null;
+            /** @description The input schema suggests it does (a URL, host or email argument, or x-caliban-network) */
+            network_hint?: boolean;
         };
         UsageEvent: {
             request_id: string;
@@ -5383,6 +5729,7 @@ export interface components {
             usage_source?: "provider" | "estimated";
             /** @description Tokens not sent upstream thanks to Caliban: on a cache hit of either tier, the cached answer's prompt plus completion tokens */
             tokens_saved?: number;
+            /** @description Always empty in reports (routing decisions are content-class; see `by_route`). Set only in transit, from a data plane. */
             intent?: string;
             /** @enum {string} */
             cache: "hit" | "miss" | "bypass";
@@ -5399,10 +5746,10 @@ export interface components {
             ts: string;
             /** @description Model the client asked for (`caliban/auto` or a pinned id). Chat requests only; absent otherwise. */
             requested_model?: string;
-            /** @description Confidence of the intent decision, 0..1. Chat requests only. */
+            /** @description In transit only (never in reports): confidence of the intent decision, 0..1. */
             intent_confidence?: number;
             /**
-             * @description Stage that decided the intent. Chat requests only.
+             * @description In transit only (never in reports): the stage that decided the intent; counted in `by_route`.
              * @enum {string}
              */
             route_stage?: "rules" | "knn" | "keyword";
@@ -5418,9 +5765,23 @@ export interface components {
             node?: string;
             node_version?: number;
             run_id?: string;
+            /** @description In transit only (never in reports): the path a caliban/auto request took */
+            route?: string;
+            /** @description In transit only (never in reports): why a model answered rather than a node; counted in `by_route` */
+            route_fallback?: string;
         };
         UsageReport: {
             events: components["schemas"]["UsageEvent"][];
+            /** @description Requests per tenant, UTC day, intent, deciding stage and fallback reason (empty strings: not set). The only routing record kept; not computed with `node` or `run_id`. */
+            by_route?: {
+                tenant_id: string;
+                /** Format: date */
+                day: string;
+                intent: string;
+                route_stage: string;
+                route_fallback: string;
+                requests: number;
+            }[];
             /** @description The same totals per node version (node calls only), raw and rolled-up days. */
             by_node?: {
                 node?: string;
@@ -5500,7 +5861,7 @@ export interface components {
         /** @enum {string} */
         Role: "owner" | "admin" | "auditor" | "tenant_admin" | "developer" | "viewer" | "billing";
         /** @enum {string} */
-        Permission: "tenants.create" | "catalog.read" | "catalog.write" | "providers.probe" | "audit.read" | "rbac.read" | "rbac.write" | "tenant.read" | "tenant.write" | "tenant.delete" | "api_keys.read" | "api_keys.write" | "provider_keys.read" | "provider_keys.write" | "routes.read" | "routes.write" | "datasources.read" | "datasources.write" | "ontology.read" | "ontology.review" | "nodes.read" | "nodes.write" | "nodes.publish" | "nodes.run" | "tools.read" | "tools.write" | "tools.approve" | "usage.read";
+        Permission: "tenants.create" | "catalog.read" | "catalog.write" | "providers.probe" | "audit.read" | "rbac.read" | "rbac.write" | "tenant.read" | "tenant.write" | "tenant.delete" | "api_keys.read" | "api_keys.write" | "provider_keys.read" | "provider_keys.write" | "routes.read" | "routes.write" | "datasources.read" | "datasources.write" | "ontology.read" | "ontology.review" | "nodes.read" | "nodes.write" | "nodes.publish" | "nodes.run" | "tools.read" | "tools.write" | "tools.approve" | "runs.read" | "runs.data" | "runs.answer" | "usage.read";
         RoleInfo: {
             role: components["schemas"]["Role"];
             /** @enum {string} */

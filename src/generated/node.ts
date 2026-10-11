@@ -49,7 +49,7 @@ export interface NodeSpec {
     effect: 'read' | 'write';
     requires?: string[];
     /**
-     * effect=write: taint labels its arguments may carry without a human approval (tool:<server>/*, datasource, *)
+     * writes, and reads that reach the network through their arguments: taint labels the arguments may carry without a human approval (tool:<server>/*, datasource, caller, *)
      */
     allow_tainted?: string[];
     [k: string]: unknown;
