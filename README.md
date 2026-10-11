@@ -289,6 +289,9 @@ Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body r
 | `pii_surrogate_scope` | `tenant`, `session` | `tenant` | How reversible PII surrogates are chosen. |
 | `semantic_cache` | `off`, `on` | `off` | Whether the tenant's eligible requests may use the semantic cache. |
 | `auto_cache_hit_fraction` | `0` to `1`, or `null` | `null` | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `null` uses the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured); sending `null` clears an override. |
+| `node_caps` | `{ steps, tokens, wall_clock_s, depth, fanout, usd? }`, or `null` | `null` | Caps on the budgets of published node versions. `null` restores the defaults (steps 200, tokens 2 000 000, wall_clock_s 3600, depth 5, fanout 32). With `usd` set, every version must declare `budgets.usd` within it. |
+| `node_spend_caps` | `{ daily_usd?, monthly_usd? }`, or `null` | `null` | What the tenant's node runs may spend on model calls per UTC day and month. A cap reached ends runs as `budget_exhausted`. `null` removes them. |
+| `node_routes` | `{ [intent]: 'node/<name>' }`, or `null` | `null` | Intents `caliban/auto` hands to the tenant's nodes (`node/<name>`, `node/<name>@published` or `node/<name>@v<N>`). `null` clears them. |
 
 ```ts
 await admin.tenants.update(tenant.id, { semantic_cache: 'on' });
@@ -301,7 +304,7 @@ console.log(t.pii_surrogate_scope, t.semantic_cache); // 'session' 'on'
 - **`auto_cache_hit_fraction`**: a cache hit (exact or semantic) calls no model, so a `caliban/auto` request answered from cache is billed this share of the flat price. Out of range is a `422`.
 - **`semantic_cache: 'on'`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
 
-Tenants from an older server omit both fields, so they are `undefined`.
+Tenants from an older server omit the fields it does not know, so they are `undefined`.
 
 #### Usage fields
 
@@ -319,7 +322,7 @@ Tenants from an older server omit both fields, so they are `undefined`.
 | `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` x the tenant's cache-hit fraction on a hit. |
 | `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
 
-`totals` adds `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
+`totals` adds `charged_usd` (what the customer is charged: the billed `caliban/auto` price, the model's cost otherwise; over a run's events it equals the run's `cost_usd`), `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
 ```ts
 const { totals } = await admin.usage.get({ tenant_id: tenant.id });
@@ -380,7 +383,7 @@ Background on model choice, serving engines and hardware tiers is in [research n
 
 ### `defineNode` (node authoring)
 
-`defineNode()` type-checks a node spec against `core/schemas/node.schema.json` and returns it unchanged, keeping literal types. Unknown top-level keys, wrong enum values and missing required fields are compile errors. Constraints TypeScript cannot express (`minimum`, `maximum`, `pattern`) are checked by the control plane.
+`defineNode()` type-checks a node spec against `core/schemas/node.schema.json` and returns it unchanged, keeping literal types. Unknown top-level keys (and unknown keys in `guards`), wrong enum values and missing required fields are compile errors. Constraints TypeScript cannot express (`minimum`, `maximum`, `pattern`, such as the `mcp://`, `node://` or `builtin://` scheme of a tool `ref`) are checked by the control plane.
 
 ```ts
 import { CalibanAdmin, defineNode } from '@caliban/sdk';
@@ -388,22 +391,36 @@ import { CalibanAdmin, defineNode } from '@caliban/sdk';
 export const invoiceTriage = defineNode({
   kind: 'agent',
   description: 'Classify inbound invoices and flag anomalies.',
-  prompt: { system: 'You triage supplier invoices.', output_schema: { type: 'object' } },
+  prompt: {
+    system: 'You triage supplier invoices.',
+    input_schema: { type: 'object', required: ['invoice_id'] }, // checked against every run's input
+    output_schema: { type: 'object' },
+  },
   model_policy: {
+    model: 'caliban/auto', // what the node's calls ask for (default: the first model id in candidates)
     candidates: ['tier:small', 'tier:frontier'],
     escalate_on: ['schema_violation', 'low_confidence'],
     min_trust_tier: 't1_attested',
     max_cost_usd: 0.02,
   },
-  tools: [{ ref: 'mcp://erp/lookup_invoice#sha256:<hash>', effect: 'read' }],
+  tools: [
+    { ref: 'mcp://erp/lookup_invoice#sha256:<hash>', effect: 'read' },
+    { ref: 'builtin://datasource_query', effect: 'read' },
+    // A write whose arguments may carry these taint labels without a human approval.
+    { ref: 'mcp://erp/flag_invoice#sha256:<hash>', effect: 'write', allow_tainted: ['datasource'] },
+  ],
   datasources: { scopes: ['erp.invoices:read'] },
   guardrails: { pii: 'reversible', injection_mode: 'plan_then_execute' },
-  budgets: { steps: 12, tokens: 40_000, wall_clock_s: 90 },
+  agent: { max_turns: 6 },                                        // kind: 'agent' only
+  budgets: { steps: 12, tokens: 40_000, wall_clock_s: 90, usd: 0.5 }, // usd: the most one run may spend
+  guards: { max_repeats: 3, tool_retries: 2 },                    // loop guard, transient tool retries
   exposure: { http: true, mcp_tool: true },
 });
 
 await new CalibanAdmin().nodes.create({ tenant_id: 't_1', name: 'invoice-triage', spec: invoiceTriage });
 ```
+
+A workflow (`kind: 'workflow'`) declares a `graph` of vertices and edges instead; `graph.entry` names the vertex a run starts at (default: the first). The helper types `NodePrompt`, `NodeTool`, `NodeToolRef`, `NodeModelPolicy`, `NodeGuardrails`, `NodeAgent`, `NodeBudgets`, `NodeGuards`, `NodeGraph`, `NodeVertex` and `NodeEdge` name the parts of a spec.
 
 Once created, a node is called from the data plane with `caliban: { node: 'invoice-triage' }`. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
 

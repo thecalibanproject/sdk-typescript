@@ -12,12 +12,25 @@ export interface NodeSpec {
   description?: string;
   prompt: {
     system: string;
+    /**
+     * Validated against the run input (JSON Schema subset, see crates/caliban-nodes/src/schema.rs)
+     */
+    input_schema?: {
+      [k: string]: unknown;
+    };
+    /**
+     * Validated against the run output (JSON Schema subset)
+     */
     output_schema?: {
       [k: string]: unknown;
     };
     [k: string]: unknown;
   };
   model_policy: {
+    /**
+     * Model id (or caliban/auto) the node's calls ask for; default: the first candidate that is a model id, else caliban/auto
+     */
+    model?: string;
     intent_classes?: string[];
     /**
      * Model ids or tiers (tier:small, tier:frontier)
@@ -30,11 +43,15 @@ export interface NodeSpec {
   };
   tools?: {
     /**
-     * mcp://server/tool#sha256:<hash> or node://name@vN
+     * mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN or builtin://datasource_query
      */
     ref: string;
     effect: 'read' | 'write';
     requires?: string[];
+    /**
+     * effect=write: taint labels its arguments may carry without a human approval (tool:<server>/*, datasource, *)
+     */
+    allow_tainted?: string[];
     [k: string]: unknown;
   }[];
   datasources?: {
@@ -56,13 +73,37 @@ export interface NodeSpec {
     egress?: string[];
     [k: string]: unknown;
   };
+  /**
+   * Only for kind=agent: the bounded tool loop.
+   */
+  agent?: {
+    /**
+     * Model turns at most (default: budgets.steps)
+     */
+    max_turns?: number;
+    [k: string]: unknown;
+  };
   budgets: {
     steps: number;
     depth?: number;
     fanout?: number;
     tokens: number;
     wall_clock_s: number;
+    /**
+     * Most one run may spend on model calls (USD, priced like the metering)
+     */
+    usd?: number;
     [k: string]: unknown;
+  };
+  guards?: {
+    /**
+     * Loop guard: the same vertex with the same input at most this many times
+     */
+    max_repeats?: number;
+    /**
+     * Retries of a tool call that failed transiently
+     */
+    tool_retries?: number;
   };
   exposure?: {
     http?: boolean;
@@ -71,11 +112,18 @@ export interface NodeSpec {
     [k: string]: unknown;
   };
   /**
-   * Only for kind=workflow. Vertices + edges; loops must declare max_iterations.
+   * Only for kind=workflow. Vertices + edges; loops must declare max_iterations. See docs/nodes.md for each vertex type's config.
    */
   graph?: {
+    /**
+     * The vertex a run starts at (default: the first)
+     */
+    entry?: string;
     vertices?: {
       id: string;
+      /**
+       * code is not yet supported (refused at publish)
+       */
       type: 'llm' | 'tool' | 'router' | 'map' | 'reduce' | 'verify' | 'human' | 'subnode' | 'code';
       config?: {
         [k: string]: unknown;

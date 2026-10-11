@@ -139,7 +139,13 @@ describe('contract alignment (type-level)', () => {
       paths['/api/v1/tenants/{tenantId}']['patch']['requestBody']['content']['application/json']
     >().toEqualTypeOf<TenantUpdate>();
     expectTypeOf<KnownKeys<TenantUpdate>>().toEqualTypeOf<
-      'pii_default' | 'pii_surrogate_scope' | 'semantic_cache' | 'auto_cache_hit_fraction'
+      | 'pii_default'
+      | 'pii_surrogate_scope'
+      | 'semantic_cache'
+      | 'auto_cache_hit_fraction'
+      | 'node_caps'
+      | 'node_spend_caps'
+      | 'node_routes'
     >();
     // Cache-hit billing: a fraction in 0..1, `null` = the deployment value (and clears it on PATCH).
     expectTypeOf<TenantUpdate['auto_cache_hit_fraction']>().toEqualTypeOf<number | null | undefined>();
@@ -175,6 +181,7 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<UsageEvent['billed_usd']>().toEqualTypeOf<number | undefined>();
     expectTypeOf<UsageEvent['saved_usd']>().toEqualTypeOf<number | undefined>();
     expectTypeOf<KnownKeys<UsageTotals>>().toEqualTypeOf<
+      | 'charged_usd'
       | 'requests'
       | 'prompt_tokens'
       | 'completion_tokens'

@@ -16,6 +16,14 @@ export interface paths {
         /**
          * OpenAI-compatible chat completion (streaming via SSE when stream=true)
          * @description Authenticate with a tenant API key (`cal_…`).
+         *
+         *     **Nodes.** `model: "node/<name>"` (or `"node/<name>@v<N>"`) runs a published node: the
+         *     messages become its input, its output is the assistant message, and a human step is the
+         *     assistant message with `finish_reason: "input_required"` (continue with the header
+         *     `Caliban-Run-Id` and the answer as the last user message). The body then carries a `caliban`
+         *     object (`run_id`, `status`, `node`, `version`, `cost_usd`, `awaiting`). With
+         *     `model: "caliban/auto"`, a tenant that maps intents to nodes gets the node when the request
+         *     classifies into such an intent (see core/docs/nodes.md).
          */
         post: {
             parameters: {
@@ -44,6 +52,13 @@ export interface paths {
                         "x-caliban-pii-entities"?: number;
                         /** @description Cost of this request in USD (non-streaming only; absent when the model has no price). */
                         "x-caliban-cost-usd"?: string;
+                        /** @description The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes). */
+                        "x-caliban-route"?: string;
+                        /** @description Why `caliban/auto` answered with a model rather than a node. */
+                        "x-caliban-route-fallback"?: "low_confidence" | "no_node_for_intent" | "node_not_allowed" | "node_unavailable" | "nodes_not_enabled" | "node_over_budget" | "node_input_invalid";
+                        /** @description The node run that answered. */
+                        "Caliban-Run-Id"?: string;
+                        "x-caliban-run-status"?: string;
                         [name: string]: unknown;
                     };
                     content: {
@@ -367,6 +382,447 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/nodes/{nodeName}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                nodeName: components["parameters"]["NodeName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a published node
+         * @description Starts a run of the node's live version (or `version`). The API key must be allowed to run
+         *     the node (its node allowlist; no allowlist: every published node of the tenant). The input
+         *     is checked against the node's `prompt.input_schema`.
+         *
+         *     **Sync** (default): waits until the run ends or waits for a human, at most the server's
+         *     `CALIBAN_NODE_SYNC_WAIT_SECS` (default 60) or `wait_s`; `200` when the run ended, `202`
+         *     with the run so far otherwise. **Async** (`"async": true`): `202` at once; poll
+         *     `GET /v1/runs/{id}` (also in `Location`).
+         *
+         *     `Idempotency-Key` (1 to 255 visible ASCII characters, per tenant, kept with the run):
+         *     a repeat returns the run the first request created (`Idempotent-Replayed: true`) and starts
+         *     nothing; the same key with another body is a `422` (`idempotency_key_reused`).
+         *
+         *     **Stream** (`"stream": true`): `200` with the run's events (`text/event-stream`, see
+         *     `GET /v1/runs/{runId}/events`) until it ends or waits for a human.
+         *
+         *     Instead of `input`, `chat.messages` gives chat messages, mapped to the node's input as the
+         *     `node/<name>` chat shortcut does.
+         *
+         *     Every model call the run makes goes through the gateway pipeline as the invoking key (PII,
+         *     caches, routing, quotas, metering), with an Idempotency-Key per step. Split-mode routers
+         *     forward this request to a worker.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: {
+                    "Idempotency-Key"?: string;
+                };
+                path: {
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description Any JSON value: the run input */
+                        input?: unknown;
+                        /** @description Chat messages instead of `input` (mapped to the node's input). */
+                        chat?: {
+                            messages: components["schemas"]["ChatMessage"][];
+                        };
+                        /** @description A published version; default: the live one */
+                        version?: number;
+                        /** @default false */
+                        async?: boolean;
+                        /**
+                         * @description Answer with the run's events (SSE)
+                         * @default false
+                         */
+                        stream?: boolean;
+                        /** @description Sync runs: wait at most this long (capped by the server) */
+                        wait_s?: number;
+                        /** @description Lowers the version's budget for this run (a larger value is ignored). */
+                        budget?: {
+                            steps?: number;
+                            tokens?: number;
+                            usd?: number;
+                            wall_clock_s?: number;
+                        };
+                    };
+                };
+            };
+            responses: {
+                /** @description The run ended (succeeded, failed, budget_exhausted or cancelled), or its event stream */
+                200: {
+                    headers: {
+                        "Caliban-Run-Id"?: string;
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRun"];
+                        "text/event-stream": string;
+                    };
+                };
+                /** @description The run is pending, running, sleeping or waiting for input */
+                202: {
+                    headers: {
+                        Location?: string;
+                        "Idempotent-Replayed"?: "true";
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRun"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List node runs
+         * @description Runs of the key's tenant, of the nodes the key may run (its allowlist), newest first.
+         *     Summaries only (no content, no steps). Page with `cursor` (`next_cursor` of the previous page;
+         *     `null` on the last).
+         */
+        get: {
+            parameters: {
+                query?: {
+                    node?: string;
+                    /** @description Comma-separated run statuses */
+                    status?: string;
+                    created_after?: string;
+                    created_before?: string;
+                    limit?: number;
+                    cursor?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRunList"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                401: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{runId}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Follow a run's events (SSE)
+         * @description The run's events from the journal, numbered from 1, so a client resumes on any worker or
+         *     router with `Last-Event-ID` (or `?after=`). Each SSE event has `id`, `event` (the type) and
+         *     `data` (a `RunEvent`). The stream ends after `run.finished`, or after `run.input_required`
+         *     while the run waits for that answer; that last event carries the run in `run`. Events never
+         *     carry step content; `run.input_required` carries the question.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    after?: number;
+                };
+                header?: {
+                    "Last-Event-ID"?: string;
+                };
+                path: {
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The event stream */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "text/event-stream": string;
+                    };
+                };
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{runId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a node run
+         * @description Durable: a run that waits (pending, sleeping, input required) is `cancelled` at once (`200`);
+         *     a running run is asked to stop (`202`, `cancel_requested: true`) and stops at its next step
+         *     boundary on whichever worker runs it (the model call in flight completes and is recorded; a
+         *     failing one is not retried). Cancelling a cancelled run is `200`; a run that ended otherwise
+         *     is `409` (`run_already_ended`). Audited as `node.run.cancel`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The run is cancelled */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRun"];
+                    };
+                };
+                /** @description The running run will stop at its next step */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRun"];
+                    };
+                };
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/mcp": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The MCP server (Streamable HTTP, stateless)
+         * @description JSON-RPC over Streamable HTTP. Authenticate with the tenant API key as bearer token (`401`
+         *     otherwise). `tools/list`: the published nodes the key may run (input schema: the node's).
+         *     `tools/call`: runs the node, waits at most `CALIBAN_NODE_SYNC_WAIT_SECS`. With
+         *     `CALIBAN_MCP_TASKS=true`, clients declaring the tasks extension get a task (its id is the run
+         *     id) and use `tasks/get`, `tasks/update`, `tasks/cancel`. See core/docs/nodes.md.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            responses: {
+                /** @description The JSON-RPC answer */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            [key: string]: unknown;
+                        };
+                    };
+                };
+                401: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{runId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a node run
+         * @description A run of the key's tenant, of a node the key may run.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRun"];
+                    };
+                };
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{runId}/input": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                runId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer the human step a run waits for
+         * @description Records the answer (sealed in the journal, with who answered: `api_key:<hash prefix>`) and
+         *     resumes the run. `step` defaults to the step the run waits for (`awaiting.step`). `409`
+         *     (`run_not_awaiting_input`) when the run is not waiting for input, or not for that step.
+         *
+         *     A step named `<step>@approve` is the approval of a write whose arguments carry untrusted taint
+         *     labels: answer `{"approve": true}` or `{"approve": false}` (a refusal fails the call). The
+         *     decision is journaled as an `approval` step (see docs/tools.md). Answers and approval decisions
+         *     are audited (`node.run.answer`, `node.write.approve`, `node.write.deny`) in the control
+         *     plane's hash-chained log, with who answered.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description Any JSON value */
+                        answer: unknown;
+                        step?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Accepted; the run resumes */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRun"];
+                    };
+                };
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -549,7 +1005,9 @@ export interface paths {
          *     (also needs `[cache.semantic] enabled`). `auto_cache_hit_fraction` sets the share of the
          *     flat `caliban/auto` price billed for this tenant's cache hits (0 to 1); `null` clears it, so
          *     the deployment's `[routing] auto_cache_hit_fraction` (default 0.2) applies. Out of range
-         *     is a 422.
+         *     is a 422. `node_caps` bounds the budgets of every node version the tenant publishes (and
+         *     promotes); `null` restores the defaults. Lowering the caps does not touch versions already
+         *     published, but promoting one that no longer fits is refused.
          */
         patch: {
             parameters: {
@@ -633,6 +1091,19 @@ export interface paths {
                 content: {
                     "application/json": {
                         name?: string;
+                        /**
+                         * @description Node allowlist: the nodes this key may run (`POST /v1/nodes/{name}/runs`). Absent:
+                         *     every published node of the tenant. `[]`: none. Granting node access needs the
+                         *     `nodes.run` permission on the tenant (`403` otherwise); a creator without it gets
+                         *     a key that runs no nodes.
+                         */
+                        nodes?: string[];
+                        /**
+                         * @description Datasource scopes (`<datasource>.<object>:read`) the built-in datasource query tool
+                         *     may read for this key's runs, intersected with each node's `datasources.scopes`.
+                         *     Absent: every scope of the nodes it runs.
+                         */
+                        datasource_scopes?: string[];
                     };
                 };
             };
@@ -646,6 +1117,7 @@ export interface paths {
                         "application/json": components["schemas"]["ApiKeyCreated"];
                     };
                 };
+                403: components["responses"]["Error"];
             };
         };
         delete?: never;
@@ -696,6 +1168,346 @@ export interface paths {
                 404: components["responses"]["Error"];
             };
         };
+        options?: never;
+        head?: never;
+        /**
+         * Change an API key's node allowlist and datasource scopes
+         * @description Absent fields are kept; `null` lifts a restriction (every published node; every scope of the
+         *     nodes it runs). Changing node access needs `nodes.run` on the tenant (`403` otherwise).
+         *     Audited as `api_key.update` with the old and new values; routers apply it with their next
+         *     snapshot.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    keyId: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        nodes?: string[] | null;
+                        datasource_scopes?: string[] | null;
+                    };
+                };
+            };
+            responses: {
+                /** @description The key */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ApiKeyInfo"];
+                    };
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The tenant's node runs (console)
+         * @description Newest first, from the node journal (the database's, or a standalone process's in-memory
+         *     one; `503` when the control plane has none). Permission `runs.read`.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    node?: string;
+                    /** @description Comma-separated run statuses */
+                    status?: string;
+                    created_after?: string;
+                    created_before?: string;
+                    limit?: number;
+                    cursor?: string;
+                };
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeRunList"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/runs/{runId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                runId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * A node run (console)
+         * @description Metadata with `runs.read`: status, budget, cost, usage, steps (vertex, kind, status, timings,
+         *     tokens, cost, taint labels). With `runs.data` also the content (`input`, `output`, each
+         *     step's `output`, the awaited `question`); `content_visible` says which.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ConsoleRun"];
+                    };
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/runs/{runId}/input": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                runId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer a question or approve or deny a tainted write (console)
+         * @description As the signed-in user (permission `runs.answer`): journaled with the user's identity and
+         *     recorded in the audit chain (`node.run.answer`, `node.write.approve`, `node.write.deny`). An
+         *     approval takes `{"approve": true}` or `{"approve": false}`. `409` when the run is not waiting
+         *     (or not for `step`).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description Any JSON value */
+                        answer: unknown;
+                        step?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Accepted; a worker resumes the run */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ConsoleRun"];
+                    };
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/inbox": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Runs waiting for a human (console)
+         * @description Questions and approvals of tainted writes, oldest wait first (permission `runs.read`; the
+         *     question with `runs.data`).
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {string} */
+                            object: "list";
+                            content_visible: boolean;
+                            data: {
+                                run_id: string;
+                                node: string;
+                                version: number;
+                                step: string;
+                                /** @enum {string} */
+                                kind: "question" | "approval";
+                                question?: string | null;
+                                invoker?: string;
+                                /** Format: date-time */
+                                waiting_since: string;
+                                /**
+                                 * Format: date-time
+                                 * @description When the human step times out (its `timeout_s`)
+                                 */
+                                expires_at?: string | null;
+                            }[];
+                        };
+                    };
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/node-spend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The tenant's node spend today and this month, against its caps
+         * @description What the tenant's node runs spent on model calls (USD, priced like the metering) today and
+         *     this month (UTC), across every worker, from the node journal (`503` without one), next to
+         *     its `node_spend_caps`. Permission `usage.read`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tenant_id: string;
+                            /** @description YYYY-MM-DD (UTC) */
+                            day: string;
+                            /** @description YYYY-MM (UTC) */
+                            month: string;
+                            today_usd: number;
+                            month_usd: number;
+                            caps: {
+                                daily_usd?: number | null;
+                                monthly_usd?: number | null;
+                            };
+                            remaining: {
+                                /** @description `null`: no cap */
+                                daily_usd?: number | null;
+                                monthly_usd?: number | null;
+                            };
+                            /** @description A cap is reached: runs stop at their next model call */
+                            capped: boolean;
+                        };
+                    };
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -762,8 +1574,9 @@ export interface paths {
         post?: never;
         /**
          * Delete a node version
-         * @description Soft-deletes one node version (`node.delete` audit row), scoped to the tenant in the path.
-         *     It is no longer listed; its version number is not reused by later versions.
+         * @description Soft-deletes one node version by its record id (`node.delete` audit row), scoped to the
+         *     tenant in the path. Drafts and retired versions can be deleted; a published version is a
+         *     409 (retire it first). It is no longer listed; its version number is not reused.
          */
         delete: {
             parameters: {
@@ -785,8 +1598,887 @@ export interface paths {
                     content?: never;
                 };
                 404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
             };
         };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List the versions of a node
+         * @description Every version not deleted (drafts, published and retired), oldest first, and the live one. Needs `nodes.read`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            name?: string;
+                            /** @description The promoted version; `null` when none is. */
+                            live?: number | null;
+                            promotion?: {
+                                version?: number;
+                                /** Format: date-time */
+                                promoted_at?: string;
+                                promoted_by?: string;
+                            } | null;
+                            versions?: components["schemas"]["Node"][];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        /**
+         * Create a draft version
+         * @description The version number is the node's latest plus one. The spec is checked statically
+         *     (schemas/node.schema.json; MCP tools pinned; cycles bounded by `max_iterations`; `code`
+         *     vertices are refused as not yet supported) and content-hashed. Versions are immutable:
+         *     changing a node means creating a new version. Needs `nodes.write`; audited as `node.create`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        spec: {
+                            [key: string]: unknown;
+                        };
+                    };
+                };
+            };
+            responses: {
+                /** @description Created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Node"];
+                    };
+                };
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+                version: components["parameters"]["NodeVersion"];
+            };
+            cookie?: never;
+        };
+        /** Get a version (spec and content hash) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Node"];
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/publish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+                version: components["parameters"]["NodeVersion"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish a draft (and promote it by default)
+         * @description Validates the draft against the tenant: the static checks again; every `node://name@vN` it
+         *     calls is a published version of the same tenant and references form no cycle; every
+         *     datasource scope (`<datasource>.<object>:<access>`) names a datasource of the tenant and
+         *     `*` or an approved ontology entity bound to it; the budgets fit the tenant's
+         *     `node_caps`; `mcp://` tools are pinned (resolving them against an approved tool registry
+         *     comes with the MCP client). The spec is then sealed under the tenant's data key (created on
+         *     first use; needs `CALIBAN_KEK`, else 400) and ships to routers and workers in the signed
+         *     snapshot. With `promote` (default `true`) it also becomes the live version, which needs the
+         *     node's promotion bar met: a version with write tools (or a node with a golden bar) is
+         *     refused (`422`, problems of kind `eval_gate`) since a draft has no evals yet; publish it with
+         *     `{"promote": false}`, run its evals, then promote it. Needs `nodes.publish`; audited as
+         *     `node.publish` (with the evals that met the bar, under `evals`). A version that is not a
+         *     draft is a 409; a validation failure is a 422 listing every problem.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @default true */
+                        promote?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description Published */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Node"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+                version: components["parameters"]["NodeVersion"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire a published version
+         * @description The version leaves the data-plane snapshot: new runs of it are refused (`404`), and runs
+         *     already started finish on the version they started on (each run keeps the specs of the
+         *     versions it can reach, sealed in the journal). If it was live, the node has no live version
+         *     until another is promoted. A version still called (`node://`) by another published version is a 409.
+         *     Retirement is final. Needs `nodes.publish`; audited as `node.retire`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Retired */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Node"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/promote": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move the promotion pointer (promote or roll back)
+         * @description Makes a published version the live one (what `POST /v1/nodes/{name}/runs` without a version
+         *     runs). Its budgets are checked against the tenant's current `node_caps` (422). The node's
+         *     promotion bar must be met by the version's latest finished evals (422, problems of kind
+         *     `eval_gate`): the golden bar when the node sets one, and for a version with write tools
+         *     always an injection eval (default bar: every attack blocked). A draft or a retired version
+         *     is a 409. Needs `nodes.publish`; audited as `node.promote` with the previous live version
+         *     and the evals that met the bar (`evals`).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        version: number;
+                    };
+                };
+            };
+            responses: {
+                /** @description Promoted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Node"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Diff two versions
+         * @description Their hashes and a structural JSON diff of their specs (JSON pointers; arrays compared index by index).
+         */
+        get: {
+            parameters: {
+                query: {
+                    from: number;
+                    to: number;
+                };
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            name?: string;
+                            from?: {
+                                version?: number;
+                                hash?: string;
+                                state?: string;
+                            };
+                            to?: {
+                                version?: number;
+                                hash?: string;
+                                state?: string;
+                            };
+                            identical?: boolean;
+                            changes?: {
+                                /** @description JSON pointer */
+                                path: string;
+                                /** @enum {string} */
+                                op: "added" | "removed" | "changed";
+                                from?: unknown;
+                                to?: unknown;
+                            }[];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/golden-set": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+                version: components["parameters"]["NodeVersion"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The golden set of a version
+         * @description Metadata with `nodes.read`; the cases (tenant content, sealed at rest) also with `runs.data`. 503 without a node journal.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["GoldenSet"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        /**
+         * Create or replace the golden set of a version
+         * @description At most 200 cases, unique ids, at least one check each; inputs are checked against the
+         *     version's `prompt.input_schema` (422 listing every problem, kind `golden_set`). Sealed under
+         *     the tenant's data key. Needs `nodes.write`; audited as `node.golden_set.update` (counts and
+         *     hashes, never cases).
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        cases: components["schemas"]["GoldenCase"][];
+                    };
+                };
+            };
+            responses: {
+                /** @description Stored */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["GoldenSet"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        post?: never;
+        /**
+         * Delete the golden set of a version
+         * @description Needs `nodes.write`; audited as `node.golden_set.delete`.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/eval-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The node's promotion bar
+         * @description `nodes.read`. `injection_bar` is the bar in effect for versions with write tools.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {string} */
+                            object?: "node.eval_policy";
+                            node?: string;
+                            policy?: components["schemas"]["EvalPolicy"];
+                            injection_bar?: number;
+                            /** Format: date-time */
+                            updated_at?: string | null;
+                            updated_by?: string | null;
+                        };
+                    };
+                };
+            };
+        };
+        /**
+         * Set the node's promotion bar
+         * @description Needs `nodes.publish` (it decides what may be promoted); audited as `node.eval_policy.update` with the old and new bar.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["EvalPolicy"];
+                };
+            };
+            responses: {
+                /** @description Stored */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                422: components["responses"]["Error"];
+            };
+        };
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/evals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+                version: components["parameters"]["NodeVersion"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start an eval of a published version
+         * @description `golden`: every case of the version's golden set (or `cases`) runs `k` times (default 3) as
+         *     ordinary node runs on workers, through the request pipeline, as the API key `api_key_id`
+         *     (it must be active and allowed to run the node; its quotas apply and its usage is metered).
+         *     `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
+         *     input is `input`, else the input of `input_case` (or the golden set's first case), whose
+         *     checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
+         *     A version that is not published is a 409.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        suite: "golden" | "injection";
+                        api_key_id: string;
+                        k?: number;
+                        /** @default 4 */
+                        concurrency?: number;
+                        /** @description Golden: only these cases */
+                        cases?: string[];
+                        /** @description Golden: the default judge model (recorded in the summary) */
+                        judge_model?: string;
+                        /** @description Injection: the run input */
+                        input?: unknown;
+                        /** @description Injection: take the input (and its checks) from this golden case */
+                        input_case?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Started */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Eval"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/nodes/{nodeName}/versions/{version}/gate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                nodeName: components["parameters"]["NodeName"];
+                version: components["parameters"]["NodeVersion"];
+            };
+            cookie?: never;
+        };
+        /**
+         * What promoting the version would say
+         * @description `nodes.read`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    nodeName: components["parameters"]["NodeName"];
+                    version: components["parameters"]["NodeVersion"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            node?: string;
+                            version?: number;
+                            has_write_tools?: boolean;
+                            allowed?: boolean;
+                            /** @description The evals that meet the bar (`golden`, `injection`), null when no gate applies */
+                            evidence?: unknown;
+                            problems?: Record<string, never>[];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/evals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The tenant's evals, newest first
+         * @description `nodes.read`. Metrics included, content never.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    node?: string;
+                    version?: number;
+                    suite?: "golden" | "injection";
+                    /** @description Comma separated */
+                    status?: string;
+                    limit?: number;
+                    cursor?: string;
+                };
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {string} */
+                            object?: "list";
+                            data?: components["schemas"]["Eval"][];
+                            next_cursor?: string | null;
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/evals/{evalId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                evalId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * An eval and its trials
+         * @description `nodes.read`; each trial's `detail` (outputs, what the scorers said, what sandboxed tools received) with `runs.data`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    evalId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Eval"];
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/evals/{evalId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                evalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel an eval
+         * @description A pending eval ends at once (200); a running one stops, with its runs in flight, at its worker's next check (202). An eval that ended otherwise is a 409. Needs `nodes.run`; audited as `node.eval.cancel`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    evalId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Cancelled */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Eval"];
+                    };
+                };
+                /** @description Cancellation asked for */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Eval"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1388,11 +3080,17 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List nodes (AI sub-apps) */
+        /**
+         * List nodes (AI sub-apps)
+         * @description Every version of every node by default (with its spec). `view=summary` lists one entry per
+         *     node instead (no specs): its live version, its latest version and state, version counts and
+         *     when it last changed.
+         */
         get: {
             parameters: {
                 query?: {
                     tenant_id?: components["parameters"]["TenantQuery"];
+                    view?: "versions" | "summary";
                 };
                 header?: never;
                 path?: never;
@@ -1400,19 +3098,20 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description OK */
+                /** @description Versions (`Node`), or summaries (`NodeSummary`) with `view=summary` */
                 200: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Node"][];
+                        "application/json": components["schemas"]["Node"][] | components["schemas"]["NodeSummary"][];
                     };
                 };
+                400: components["responses"]["Error"];
             };
         };
         put?: never;
-        /** Create a node version (spec validated against schemas/node.schema.json) */
+        /** Create a draft node version (same as POST /api/v1/tenants/{tenantId}/nodes/{nodeName}/versions) */
         post: {
             parameters: {
                 query?: never;
@@ -1443,6 +3142,473 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tenantId}/tool-servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /** Registered MCP tool servers (tools.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ToolServer"][];
+                    };
+                };
+            };
+        };
+        put?: never;
+        /**
+         * Register an MCP tool server (tools.write)
+         * @description Registering a server is what allows node tools to reach it (the egress allowlist). The URL must be
+         *     Streamable HTTP (`http` or `https`; stdio servers are not supported) and pass the egress rules (no
+         *     link-local or metadata addresses; loopback only with `CALIBAN_MCP_ALLOW_LOOPBACK`). `credential` is
+         *     sealed under the tenant's data key at once and never returned. Audited (`tool_server.create`).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["ToolServerCreate"];
+                };
+            };
+            responses: {
+                /** @description Created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ToolServer"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/tool-servers/{server}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                server: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a tool server (tools.write)
+         * @description Soft delete; its credential is wiped and its tools leave the data plane. `409` while a published node version uses it (change it in place with `PATCH` instead).
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        /**
+         * Change a tool server (tools.write)
+         * @description Absent fields are kept. A new `credential` is sealed at once and never returned (rotation);
+         *     `null` removes it (refused when the auth method needs one). The auth method, the credential
+         *     and `trusted` keep the approvals; a new `url` withdraws every approval of the server's
+         *     manifests (discover and approve again; published versions calling its tools fail until then).
+         *     The URL (and an OAuth token URL) must pass the egress rules (`422`). Audited as
+         *     `tool_server.update`.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        url?: string;
+                        auth?: components["schemas"]["ToolAuth"];
+                        credential?: string | null;
+                        trusted?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description The server */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ToolServer"] & {
+                            /** @description Approvals the URL change withdrew */
+                            approvals_withdrawn: number;
+                        };
+                    };
+                };
+                400: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/tool-servers/{server}/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                server: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discover a server's tools (tools.write)
+         * @description The control plane connects through the egress guard (with a discovery token for `caliban_token` servers),
+         *     lists the tools, pins each manifest and runs the injection scan. A manifest seen with a new pin is a new,
+         *     `discovered` record: a server cannot change an approved tool. Audited (`tool.discover`).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The manifests the server lists now */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            server?: string;
+                            tools?: components["schemas"]["ToolManifest"][];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+                502: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/tool-servers/{server}/tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                server: string;
+            };
+            cookie?: never;
+        };
+        /** Every manifest recorded for the server, with pins, scan findings and status (tools.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ToolManifest"][];
+                    };
+                };
+            };
+        };
+        put?: never;
+        /** Import manifests (a server the control plane cannot reach) (tools.write) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        manifests: {
+                            name: string;
+                            description: string;
+                            /** @description The tool's input JSON Schema (any JSON object) */
+                            input_schema: {
+                                [key: string]: unknown;
+                            };
+                        }[];
+                    };
+                };
+            };
+            responses: {
+                /** @description The recorded manifests */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            server?: string;
+                            tools?: components["schemas"]["ToolManifest"][];
+                        };
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                server: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a manifest by pin (tools.approve)
+         * @description Only approved manifests reach the data plane and can be pinned by a published node version. A manifest
+         *     with scan findings needs `acknowledge_findings: true` (`422` otherwise). Audited (`tool.approve`, with the
+         *     findings and the acknowledgement).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                    tool: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description sha256:<hex> */
+                        pin: string;
+                        /** @default false */
+                        acknowledge_findings?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description Approved; `ref` is what node specs pin */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tool?: components["schemas"]["ToolManifest"];
+                            /** @description mcp://server/tool#sha256:<hex> */
+                            ref?: string;
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/tool-servers/{server}/tools/{tool}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                server: string;
+                tool: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Withdraw the approval of a manifest (tools.approve) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    server: string;
+                    tool: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        pin: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Revoked */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/.well-known/caliban-tool-jwks.json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The public keys tool servers verify minted tool tokens with
+         * @description The current and previous `CALIBAN_TOOL_TOKEN_*` public keys (RFC 8037 OKP, Ed25519, `alg: EdDSA`). Tokens are
+         *     minted per call, audience-bound (the server's audience), scoped to one tool (`scope: tool:<name>`) and live
+         *     60 seconds. Empty without a key.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description JWKS */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            keys?: {
+                                /** @enum {string} */
+                                kty?: "OKP";
+                                /** @enum {string} */
+                                crv?: "Ed25519";
+                                /** @enum {string} */
+                                alg?: "EdDSA";
+                                /** @enum {string} */
+                                use?: "sig";
+                                kid?: string;
+                                x?: string;
+                            }[];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/usage": {
         parameters: {
             query?: never;
@@ -1450,11 +3616,26 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Recent usage events and aggregate savings */
+        /**
+         * Recent usage events and aggregate savings
+         * @description With the Postgres store, from `usage_event`: every data plane's events (split-mode routers ship theirs
+         *     through `POST /api/v1/usage/ingest`), totals over all of them, including the days rolled up into
+         *     `usage_daily` once raw events pass `CALIBAN_USAGE_RETENTION_DAYS` (the totals do not change). With the
+         *     in-memory store, the last 10,000 events of the process. `node` and `run_id` filter node calls; `by_node`
+         *     totals each node version (cost per node); a `run_id` covers raw events only. `from` and `to`
+         *     limit the events, the totals and `by_node` to `from <= ts < to`; a rolled-up day counts when its
+         *     start (00:00 UTC) is in the range.
+         */
         get: {
             parameters: {
                 query?: {
                     tenant_id?: components["parameters"]["TenantQuery"];
+                    node?: string;
+                    run_id?: string;
+                    /** @description Events at or after this time (RFC 3339) */
+                    from?: string;
+                    /** @description Events before this time; `400` unless after `from` */
+                    to?: string;
                     limit?: number;
                 };
                 header?: never;
@@ -1597,6 +3778,618 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/keys/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * KEK rotation status (the same report as `caliban keys status`)
+         * @description Which KEK wraps each tenant data key and seals each shared provider key, what still waits for migration,
+         *     whether the retired keys in `CALIBAN_KEK_PREVIOUS` are still needed by stored data
+         *     (`previous_keks_still_needed`), and what each split-mode router reported on its last snapshot poll
+         *     (`routers`: `active` when seen within 10 minutes, `snapshot_version`, `snapshot_kek_ids`, `keyring`,
+         *     `needs_previous_kek`, `has_current_kek`). `routers_on_previous_keks` lists the active routers whose snapshot
+         *     still needs a retired KEK; `rotation_complete` is true when neither stored data nor an active router does,
+         *     which is when `CALIBAN_KEK_PREVIOUS` can be removed. Needs `audit.read`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            [key: string]: unknown;
+                        };
+                    };
+                };
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The roles and the permissions each grants */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RoleInfo"][];
+                    };
+                };
+                403: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Users known from the identity provider (created just in time) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["User"][];
+                    };
+                };
+                403: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/{userId}/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                userId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Sign the user out everywhere (revokes every active session)
+         * @description Audited as `user.sessions_revoke`.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    userId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Revoked */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/role-bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Stored role bindings, and the group mappings from the config file */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RoleBindingList"];
+                    };
+                };
+                403: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        /**
+         * Grant a role to a user or an identity-provider group
+         * @description Deployment roles (`owner`, `admin`, `auditor`) take no `tenant_id`; tenant roles (`tenant_admin`,
+         *     `developer`, `viewer`, `billing`) need one (`422` otherwise). Only an owner can grant `owner`
+         *     (`403`). A user subject must be a user id (`404` if unknown). Takes effect on the next request.
+         *     Audited as `role_binding.create`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RoleBindingCreate"];
+                };
+            };
+            responses: {
+                /** @description Created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RoleBinding"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/role-bindings/{bindingId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bindingId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke a role binding
+         * @description Only an owner can revoke an `owner` binding. Audited as `role_binding.delete`.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    bindingId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Revoked */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** How the console should offer login (public) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AuthConfig"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start single sign-on (browser navigation)
+         * @description Redirects (303) to the identity provider (authorization code flow with PKCE) and sets a short-lived
+         *     login cookie. On failure to reach the provider, redirects to `/#/login?error=idp_unavailable`.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Path on the console to come back to (same origin only), e.g. `/#/tenants`. */
+                    return_to?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description To the identity provider */
+                303: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Identity provider redirect target (browser navigation)
+         * @description Validates the state, the login cookie and the ID token, creates the session cookie (HttpOnly,
+         *     SameSite=Strict) and redirects (303) to `return_to`. Failures redirect to
+         *     `/#/login?error=login_failed` (audited as `auth.login_failed`) or `/#/login?error=login_expired`.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    code?: string;
+                    state?: string;
+                    error?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description To the console */
+                303: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End the console session
+         * @description Needs `X-CSRF-Token`. Clears the cookie; audited as `auth.logout`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Logged out */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @description The provider's logout URL (RP-initiated logout), if it has one. */
+                            end_session_url: string | null;
+                        };
+                    };
+                };
+                400: components["responses"]["Error"];
+                401: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The authenticated caller, roles and effective permissions */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Me"];
+                    };
+                };
+                401: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/usage/ingest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Usage events from a split-mode router
+         * @description Authenticated with the router token (`CALIBAN_ROUTER_TOKEN`), not the admin token. Each `request_id` is
+         *     stored once: a batch sent again (lost acknowledgement, router restart) is answered with `duplicates` and
+         *     not counted again. Invalid events (empty or oversized ids) are counted as `rejected` and dropped. Billing
+         *     fields are stored as the router computed them.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        router_id?: string;
+                        events: components["schemas"]["UsageEvent"][];
+                    };
+                };
+            };
+            responses: {
+                /** @description Stored */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @description Events stored for the first time */
+                            accepted: number;
+                            /** @description Events already stored; ignored */
+                            duplicates: number;
+                            /** @description Invalid events; ignored */
+                            rejected: number;
+                        };
+                    };
+                };
+                400: components["responses"]["Error"];
+                401: components["responses"]["Error"];
+                413: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/audit/ingest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run decisions from the data plane
+         * @description Authenticated with the router token. Workers deliver the decisions made on the data plane
+         *     (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`) at least once;
+         *     each event id is recorded once in the hash-chained audit log, so a retry appends nothing.
+         *     Other actions are `rejected`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        router_id?: string;
+                        events: {
+                            /** @description Stable: `<run>/<step>/answer`, `<run>/cancel` */
+                            id: string;
+                            tenant_id: string;
+                            actor: string;
+                            action: string;
+                            target?: string | null;
+                            detail: {
+                                [key: string]: unknown;
+                            };
+                            /** Format: date-time */
+                            at: string;
+                        }[];
+                    };
+                };
+            };
+            responses: {
+                /** @description Recorded */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            accepted: number;
+                            duplicates: number;
+                            rejected: number;
+                        };
+                    };
+                };
+                400: components["responses"]["Error"];
+                401: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/snapshot": {
         parameters: {
             query?: never;
@@ -1610,12 +4403,23 @@ export interface paths {
          *     control plane has `CALIBAN_SNAPSHOT_SIGNING_KEY` and `CALIBAN_ROUTER_TOKEN`. The ETag is a digest of the
          *     config; send it back in `If-None-Match` to get 304 while nothing changed. Verify `signature` (Ed25519 over
          *     `"caliban-snapshot-v1\0" ‖ base64-decoded payload`) before parsing `payload`. Sealed BYOK keys stay sealed.
+         *
+         *     Routers check in with every poll through the `x-caliban-router-*` headers (what they serve); the control
+         *     plane records them for `GET /api/v1/keys/status`. Polls without `x-caliban-router-id` are not recorded.
          */
         get: {
             parameters: {
                 query?: never;
                 header?: {
                     "If-None-Match"?: string;
+                    /** @description The router's id (`CALIBAN_ROUTER_ID`, else its host name); 1 to 128 of `[A-Za-z0-9._:-]`. */
+                    "x-caliban-router-id"?: string;
+                    /** @description Version label of the snapshot the router serves. */
+                    "x-caliban-router-snapshot"?: string;
+                    /** @description Comma-separated `kek_ids` of the snapshot the router serves. */
+                    "x-caliban-router-snapshot-kek-ids"?: string;
+                    /** @description Comma-separated ids of the router's own keyring, current KEK first. */
+                    "x-caliban-router-keyring"?: string;
                 };
                 path?: never;
                 cookie?: never;
@@ -1659,10 +4463,18 @@ export interface components {
         Error: {
             error: {
                 message: string;
-                /** @description e.g. invalid_request_error, authentication_error, policy_violation, upstream_error, rate_limited */
+                /** @description e.g. invalid_request_error, authentication_error, permission_error, policy_violation, upstream_error, rate_limited */
                 type: string;
-                /** @description For rate_limited: the limit that was hit (e.g. tokens_per_minute). */
+                /** @description For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`). */
                 code?: string | null;
+                /** @description Node version refusals (`422`, `validation_failed`): every reason, one by one, next to `message` (which joins them). */
+                problems?: {
+                    /** @enum {string} */
+                    kind: "spec" | "tool" | "datasource_scope" | "budget" | "node_ref" | "cycle" | "eval_gate" | "golden_set";
+                    message: string;
+                    /** @description Where in the spec: `tools[0]`, `datasources.scopes[1]`, `budgets.steps`, `node://risk@v2` */
+                    path?: string;
+                }[];
             };
         };
         Health: {
@@ -1842,6 +4654,11 @@ export interface components {
             pii_surrogate_scope?: "tenant" | "session";
             /** @description Share of the flat `caliban/auto` price billed when a cache tier (exact or semantic) answers this tenant's request: no model is called. `null`: the deployment's `[routing] auto_cache_hit_fraction` (default 0.2) applies. */
             auto_cache_hit_fraction?: number | null;
+            /** @description `null`: the defaults (steps 200, tokens 2000000, wall_clock_s 3600, depth 5, fanout 32). */
+            node_caps?: components["schemas"]["NodeCaps"] | null;
+            /** @description Caps on what the tenant's node runs spend on model calls; `null`: none. */
+            node_spend_caps?: components["schemas"]["NodeSpendCaps"] | null;
+            node_routes?: components["schemas"]["NodeRoutes"];
             /** Format: date-time */
             created_at: string;
             /**
@@ -1872,6 +4689,9 @@ export interface components {
             semantic_cache?: "off" | "on";
             /** @description Overrides `[routing] auto_cache_hit_fraction` for this tenant. Omitted or `null`: the deployment value. */
             auto_cache_hit_fraction?: number | null;
+            node_caps?: components["schemas"]["NodeCaps"];
+            node_spend_caps?: components["schemas"]["NodeSpendCaps"];
+            node_routes?: components["schemas"]["NodeRoutes"];
         };
         TenantUpdate: {
             /** @enum {string} */
@@ -1882,6 +4702,38 @@ export interface components {
             semantic_cache?: "off" | "on";
             /** @description A number sets the override; `null` clears it (the deployment value applies); absent keeps it. */
             auto_cache_hit_fraction?: number | null;
+            /** @description Caps on the budgets of published node versions; `null` restores the defaults; absent keeps them. */
+            node_caps?: components["schemas"]["NodeCaps"] | null;
+            /** @description Daily and monthly caps on node spend; `null` removes them; absent keeps them. */
+            node_spend_caps?: components["schemas"]["NodeSpendCaps"] | null;
+            node_routes?: components["schemas"]["NodeRoutes"];
+        };
+        /**
+         * @description Intents `caliban/auto` hands to the tenant's nodes: intent id to `node/<name>` (the live
+         *     version), `node/<name>@published` (the same) or `node/<name>@v<N>`. Overrides
+         *     `[routing.tenants.<id>.routes]` of the config file, intent by intent. On update: `null`
+         *     clears it, absent keeps it.
+         */
+        NodeRoutes: {
+            [key: string]: string;
+        } | null;
+        /**
+         * @description Caps on what the tenant's node runs spend on model calls (USD, priced like the metering), per
+         *     UTC day and month, across all workers: checked before every model call against the journal's
+         *     per-day totals. A cap reached ends runs gracefully (`budget_exhausted`).
+         */
+        NodeSpendCaps: {
+            daily_usd?: number;
+            monthly_usd?: number;
+        };
+        NodeCaps: {
+            steps: number;
+            tokens: number;
+            wall_clock_s: number;
+            depth: number;
+            fanout: number;
+            /** @description When set, every version must declare `budgets.usd` within it (the most one run may spend). */
+            usd?: number;
         };
         ApiKeyInfo: {
             id: string;
@@ -1895,6 +4747,10 @@ export interface components {
              * @description Set once the key is revoked.
              */
             revoked_at?: string | null;
+            /** @description Node allowlist. `null`: every published node of the tenant; `[]`: none. */
+            nodes?: string[] | null;
+            /** @description Datasource scopes the built-in query tool may read for this key (absent: every scope of the nodes it runs). */
+            datasource_scopes?: string[];
         };
         ApiKeyCreated: components["schemas"]["ApiKeyInfo"] & {
             /** @description Plaintext key. Shown once. */
@@ -2075,7 +4931,9 @@ export interface components {
             version: number;
             elements: components["schemas"]["OntologyElement"][];
         };
+        /** @description One immutable node version. */
         Node: {
+            /** @description Record id (DELETE /api/v1/tenants/{tenantId}/nodes/{id}) */
             id: string;
             tenant_id: string;
             name: string;
@@ -2084,8 +4942,354 @@ export interface components {
             spec: {
                 [key: string]: unknown;
             };
+            /** @description `sha256:<hex>` over the canonical spec JSON (keys sorted, no whitespace). Stable across key order and formatting. */
+            hash: string;
+            /** @enum {string} */
+            state: "draft" | "published" | "retired";
+            /** @description The promotion pointer names this version. */
+            live: boolean;
             /** Format: date-time */
             created_at: string;
+            created_by?: string | null;
+            /** Format: date-time */
+            published_at?: string | null;
+            /** Format: date-time */
+            retired_at?: string | null;
+            /** @description Broad `allow_tainted` entries (`*`, or a `tool:` pattern wider than one server): standing authority for tainted writes. Warnings, not refusals: the injection suite runs every version with its real allowlist. */
+            warnings?: {
+                /** @enum {string} */
+                kind: "allowlist";
+                message: string;
+                /** @description e.g. `tools[1].allow_tainted[0]` */
+                path?: string;
+            }[];
+        };
+        GoldenCase: {
+            id: string;
+            /** @description The run input (checked against prompt.input_schema) */
+            input: unknown;
+            /** @description Shorthand for an exact check */
+            expected?: unknown;
+            checks?: components["schemas"]["EvalCheck"][];
+            /** @description Scripted answers to human steps, by step id (`clarify#0`, `write#0@approve`) or vertex id (`clarify`, `write@approve`). A question without one fails the trial; a tainted write without one is denied. */
+            answers?: {
+                [key: string]: unknown;
+            };
+            tags?: string[];
+        };
+        /** @description A check of the run output. Text checks see the output as text (a string as is, other JSON compact). */
+        EvalCheck: {
+            /** @constant */
+            type: "exact";
+            /** @description A string compares with the output text; any other JSON with the output parsed as JSON */
+            value: unknown;
+            /** @default true */
+            strip?: boolean;
+            /** @default true */
+            case_sensitive?: boolean;
+        } | {
+            /** @constant */
+            type: "contains";
+            value: string | string[];
+            /** @default true */
+            case_sensitive?: boolean;
+        } | {
+            /** @constant */
+            type: "regex";
+            pattern: string;
+            flags?: ("IGNORECASE" | "MULTILINE" | "DOTALL")[];
+        } | {
+            /** @constant */
+            type: "json_schema";
+            /** @description The JSON Schema subset node specs use */
+            schema: Record<string, never>;
+        } | {
+            /** @constant */
+            type: "llm_judge";
+            rubric: string;
+            /** @description Default: the eval's judge_model, else caliban/auto. Called through the gateway as the eval's API key. */
+            model?: string;
+            /** @default 0.5 */
+            threshold?: number;
+        };
+        GoldenSet: {
+            /** @enum {string} */
+            object: "node.golden_set";
+            node: string;
+            version: number;
+            /** @description `sha256:<hex>` of the cases' canonical JSON */
+            hash: string;
+            case_count: number;
+            /** Format: date-time */
+            updated_at: string;
+            updated_by: string;
+            /** @description The caller holds runs.data: `cases` is included */
+            content_visible: boolean;
+            cases?: components["schemas"]["GoldenCase"][];
+        };
+        EvalPolicy: {
+            golden?: {
+                /** @description Least pass^k: the share of cases whose k runs all passed */
+                min_pass_k: number;
+                /** @default 1 */
+                min_k?: number;
+                max_cost_per_success_usd?: number;
+                max_p95_latency_ms?: number;
+            };
+            injection?: {
+                /** @description Least share of attacks blocked. Default 1 (every attack). An injection eval is required for versions with write tools whatever the bar. */
+                min_pass_rate: number;
+            };
+        };
+        Eval: {
+            id: string;
+            /** @enum {string} */
+            object: "node.eval";
+            node: string;
+            version: number;
+            hash: string;
+            /** @enum {string} */
+            suite: "golden" | "injection";
+            k: number;
+            concurrency?: number;
+            case_count: number;
+            /** @enum {string} */
+            status: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+            created_by?: string;
+            api_key_id?: string | null;
+            /**
+             * @description Metrics only. Golden: `k`, `cases`, `trials`, `passed_trials`, `errors`, `pass_hat_k`
+             *     (pass^k), `pass_at_1`, `pass_at_k`, `cost_usd`, `cost_per_success_usd`,
+             *     `judge_cost_usd`, `tokens`, `latency_ms` (`p50`, `p95`), `by_case`, `golden_hash`,
+             *     `judge` (default model, prompt version and hash, temperature). Injection:
+             *     `suite_version`, `trials`, `blocked`, `pass_rate`, `attack_success_rate`,
+             *     `attacks_succeeded`, `attacked` (the model followed the injection),
+             *     `utility_under_attack`, `by_category`, `not_applicable` (`case`, `reason`), `cases`,
+             *     `cost_usd`, `latency_ms`.
+             */
+            summary?: Record<string, never> | null;
+            error?: string | null;
+            cancel_requested?: boolean;
+            cancelled_by?: string | null;
+            claims?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            started_at?: string | null;
+            /** Format: date-time */
+            finished_at?: string | null;
+            /** @description Detail only. */
+            trials?: {
+                case?: string;
+                trial?: number;
+                run_id?: string | null;
+                /** @enum {string} */
+                status?: "running" | "passed" | "failed" | "error";
+                cost_usd?: number;
+                latency_ms?: number;
+                tokens?: number;
+                /** @description Metadata: checks passed (golden); category, attacked, succeeded, defenses, utility (injection) */
+                verdict?: Record<string, never>;
+                /** @description With runs.data only: the output and what the scorers said, or what the sandboxed tools received */
+                detail?: unknown;
+                /** Format: date-time */
+                finished_at?: string | null;
+            }[];
+            content_visible?: boolean;
+        };
+        NodeRun: {
+            id: string;
+            /** @enum {string} */
+            object: "node.run";
+            node: string;
+            version: number;
+            /** @description Content hash of the version that runs */
+            hash: string;
+            status: components["schemas"]["RunStatus"];
+            /** @description The run output; on budget_exhausted and cancelled (and failed, when there is one) the partial result */
+            output?: unknown;
+            /** @description The run ended on a budget overrun: output is partial */
+            partial?: boolean;
+            error?: string | null;
+            /** @description Why a run stopped early (a budget), or a note on a run that succeeded (a loop that hit max_iterations) */
+            stop_reason?: string | null;
+            awaiting?: {
+                step?: string;
+                question?: string | null;
+            } | null;
+            budget: {
+                steps_limit?: number;
+                steps_used?: number;
+                tokens_limit?: number;
+                tokens_used?: number;
+                wall_clock_ms_limit?: number;
+                /** @description Execution time only (not waiting for a human or a timer) */
+                wall_clock_ms_used?: number;
+                /** @description Model spend so far, priced like the metering */
+                usd?: number;
+                /** @description The run's USD cap (absent: none; tenant caps still apply) */
+                usd_limit?: number;
+                depth_limit?: number;
+                /** @description Deepest subnode nesting reached */
+                depth_used?: number;
+                fanout_limit?: number;
+                /** @description Widest map reached */
+                fanout_used?: number;
+            };
+            /** @description What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events */
+            cost_usd?: number;
+            usage?: components["schemas"]["RunUsage"];
+            steps: components["schemas"]["RunStep"][];
+            /** @description How many times a worker claimed the run (more than 1 after a takeover or a resume) */
+            claims?: number;
+            /** @description What started the run when not a run request: `auto:<intent>` (caliban/auto) */
+            origin?: string;
+            /** @description A cancellation was asked for and the run has not stopped yet */
+            cancel_requested?: boolean;
+            /** @description Number of the run's last event (resume its event stream after it) */
+            last_event?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            started_at?: string | null;
+            /** Format: date-time */
+            finished_at?: string | null;
+        };
+        NodeSummary: {
+            tenant_id: string;
+            name: string;
+            /** @description The latest version's `description` */
+            description?: string | null;
+            /** @enum {string|null} */
+            kind?: "workflow" | "agent" | null;
+            /** @description The promoted version */
+            live_version?: number | null;
+            latest?: {
+                version: number;
+                /** @enum {string} */
+                state: "draft" | "published" | "retired";
+                hash: string;
+            };
+            /** @description Versions not deleted */
+            versions: number;
+            published: number;
+            drafts: number;
+            retired: number;
+            /**
+             * Format: date-time
+             * @description The last creation, publication, retirement or promotion
+             */
+            updated_at?: string | null;
+        };
+        /** @enum {string} */
+        RunStatus: "pending" | "running" | "sleeping" | "input_required" | "succeeded" | "failed" | "budget_exhausted" | "cancelled";
+        /** @description Tokens of the run's model calls so far */
+        RunUsage: {
+            prompt_tokens: number;
+            completion_tokens: number;
+            total_tokens: number;
+        };
+        RunStep: {
+            /** @description Deterministic step id, e.g. classify#0, fanout#0/3, agent#2.1 */
+            id: string;
+            vertex: string;
+            kind: string;
+            /** @enum {string} */
+            status: "completed" | "failed";
+            tokens: number;
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            usd: number;
+            /** @description Taint labels of the step's output */
+            labels: string[];
+            /** Format: date-time */
+            started_at: string;
+            duration_ms: number;
+            /** @description Console only, with `runs.data`: the step's output */
+            output?: unknown;
+        };
+        NodeRunSummary: {
+            id: string;
+            /** @enum {string} */
+            object: "node.run";
+            node: string;
+            version: number;
+            status: components["schemas"]["RunStatus"];
+            awaiting_step?: string | null;
+            cost_usd: number;
+            origin?: string;
+            /** @description `api_key:<hash prefix>` */
+            invoker: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            finished_at?: string | null;
+        };
+        NodeRunList: {
+            /** @enum {string} */
+            object: "list";
+            data: components["schemas"]["NodeRunSummary"][];
+            /** @description Pass as `cursor` for the next page */
+            next_cursor: string | null;
+        };
+        /** @description One event of a run's stream (the `data` of an SSE event). */
+        RunEvent: {
+            /** @description Numbered from 1 per run; the SSE `id` */
+            id: number;
+            /** @enum {string} */
+            type: "run.created" | "step.started" | "step.finished" | "run.input_required" | "run.sleeping" | "run.input_received" | "run.cancel_requested" | "run.finished";
+            run_id: string;
+            /** Format: date-time */
+            at: string;
+            /** @description By type: step events `step`, `vertex`, `kind`, `labels`, and on finish `status`, `tokens`, `prompt_tokens`, `completion_tokens`, `usd`, `cost_usd`, `duration_ms`; `run.input_required` `step`, `question`; `run.input_received` `step`, `by`; `run.finished` `status`, `error`, `stop_reason`, `cost_usd`. */
+            data: {
+                [key: string]: unknown;
+            };
+            /** @description On the last event of a stream */
+            run?: components["schemas"]["NodeRun"];
+        };
+        ConsoleRun: {
+            id: string;
+            /** @enum {string} */
+            object: "node.run";
+            node: string;
+            version: number;
+            hash?: string;
+            status: components["schemas"]["RunStatus"];
+            invoker?: string;
+            origin?: string | null;
+            error?: string | null;
+            stop_reason?: string | null;
+            partial?: boolean;
+            awaiting?: {
+                step?: string;
+                /** @enum {string} */
+                kind?: "question" | "approval";
+                /** @description With `runs.data` */
+                question?: string | null;
+            } | null;
+            cancel_requested?: boolean;
+            cancelled_by?: string | null;
+            budget: {
+                [key: string]: unknown;
+            };
+            cost_usd?: number;
+            usage?: components["schemas"]["RunUsage"];
+            claims?: number;
+            last_event?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            started_at?: string | null;
+            /** Format: date-time */
+            finished_at?: string | null;
+            /** @description The caller holds `runs.data`: `input`, `output` and step outputs are included */
+            content_visible: boolean;
+            /** @description With `runs.data` */
+            input?: unknown;
+            /** @description With `runs.data` */
+            output?: unknown;
+            steps: components["schemas"]["RunStep"][];
         };
         NodeCreate: {
             tenant_id: string;
@@ -2093,6 +5297,72 @@ export interface components {
             spec: {
                 [key: string]: unknown;
             };
+        };
+        /** @description How Caliban authenticates to the server. Client tokens are never passed through. */
+        ToolAuth: {
+            /** @enum {string} */
+            method: "caliban_token" | "api_key" | "oauth_client_credentials" | "none";
+            /** @description caliban_token: `aud` of minted tokens (default: the URL's origin) */
+            audience?: string;
+            /** @description api_key: the header carrying the key (default `Authorization: Bearer`) */
+            header?: string;
+            /** @description oauth_client_credentials */
+            token_url?: string;
+            /** @description oauth_client_credentials */
+            client_id?: string;
+            /** @description oauth_client_credentials: requested scope (down-scoping) */
+            scope?: string;
+        };
+        ToolServer: {
+            id: string;
+            tenant_id: string;
+            /** @description The `server` of `mcp://server/tool#sha256:...` */
+            name: string;
+            url: string;
+            auth: components["schemas"]["ToolAuth"];
+            /** @description Trusted with personal data: PII surrogates in arguments are rehydrated for it */
+            trusted: boolean;
+            /** @description A credential is stored (absent: none) */
+            has_credential?: boolean;
+            /** Format: date-time */
+            created_at: string;
+            created_by: string;
+        };
+        ToolServerCreate: {
+            name: string;
+            url: string;
+            auth?: components["schemas"]["ToolAuth"];
+            /** @description API key or OAuth client secret; sealed at once, never returned */
+            credential?: string;
+            /** @default false */
+            trusted?: boolean;
+        };
+        ToolManifest: {
+            id: string;
+            tenant_id: string;
+            server: string;
+            name: string;
+            description: string;
+            /** @description The tool's input JSON Schema, as the server lists it (any JSON object) */
+            input_schema: {
+                [key: string]: unknown;
+            };
+            /** @description sha256 over the canonical [name, description, input_schema] */
+            pin: string;
+            findings: {
+                /** @enum {string} */
+                kind: "instruction" | "hidden_unicode" | "url" | "exfiltration";
+                location: string;
+                excerpt: string;
+            }[];
+            /** @enum {string} */
+            status: "discovered" | "approved" | "revoked";
+            /** Format: date-time */
+            discovered_at: string;
+            /** Format: date-time */
+            approved_at: string | null;
+            approved_by: string | null;
+            findings_acknowledged: boolean;
         };
         UsageEvent: {
             request_id: string;
@@ -2144,41 +5414,54 @@ export interface components {
             billed_usd?: number;
             /** @description Cache hits only: what the hit saved the customer. `caliban/auto`: `flat_price_usd - billed_usd`. Other models: the model cost the hit avoided (the cached answer's tokens at the input and output price; nothing reached the provider). Absent on misses and for unpriced models. */
             saved_usd?: number;
+            /** @description Node model calls only: the node of the run (its root node: a subnode's calls are the run's). */
+            node?: string;
+            node_version?: number;
+            run_id?: string;
         };
         UsageReport: {
             events: components["schemas"]["UsageEvent"][];
-            totals: {
-                requests?: number;
-                prompt_tokens?: number;
-                completion_tokens?: number;
-                /** @description Prompt tokens read from provider prompt caches */
-                cached_prompt_tokens?: number;
-                /** @description Prompt tokens written to provider prompt caches */
-                cache_write_tokens?: number;
-                /** @description Events with `usage_source: estimated` */
-                estimated_requests?: number;
-                /** @description Hits of both tiers. */
-                cache_hits?: number;
-                /** @description Sum of `saved_usd`: what cache hits saved customers, all models */
-                saved_usd?: number;
-                semantic_cache_hits?: number;
-                tokens_saved?: number;
-                cost_usd?: number;
-                /** @description Requests that asked for `caliban/auto` */
-                auto_requests?: number;
-                /** @description `caliban/auto` requests answered by a cache tier (billed at the discounted price) */
-                auto_cache_hits?: number;
-                /** @description Full flat price, summed over `caliban/auto` events that carry both prices (cache hits at their full price) */
-                flat_price_usd?: number;
-                /** @description What those events were billed: the flat price on misses, the discounted price on cache hits */
-                billed_usd?: number;
-                /** @description What `caliban/auto` cache hits saved customers: flat_price_usd - billed_usd over hits */
-                auto_saved_usd?: number;
-                /** @description Sum over the same events (0 on cache hits) */
-                routed_model_cost_usd?: number;
-                /** @description billed_usd - routed_model_cost_usd */
-                margin_usd?: number;
-            };
+            /** @description The same totals per node version (node calls only), raw and rolled-up days. */
+            by_node?: {
+                node?: string;
+                node_version?: number;
+                totals?: components["schemas"]["UsageTotals"];
+            }[];
+            totals: components["schemas"]["UsageTotals"];
+        };
+        UsageTotals: {
+            /** @description What the customer is charged: the billed `caliban/auto` price (discounted on cache hits), the model's cost otherwise. Over a run's events it equals the run's `cost_usd`. */
+            charged_usd?: number;
+            requests?: number;
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            /** @description Prompt tokens read from provider prompt caches */
+            cached_prompt_tokens?: number;
+            /** @description Prompt tokens written to provider prompt caches */
+            cache_write_tokens?: number;
+            /** @description Events with `usage_source: estimated` */
+            estimated_requests?: number;
+            /** @description Hits of both tiers. */
+            cache_hits?: number;
+            /** @description Sum of `saved_usd`: what cache hits saved customers, all models */
+            saved_usd?: number;
+            semantic_cache_hits?: number;
+            tokens_saved?: number;
+            cost_usd?: number;
+            /** @description Requests that asked for `caliban/auto` */
+            auto_requests?: number;
+            /** @description `caliban/auto` requests answered by a cache tier (billed at the discounted price) */
+            auto_cache_hits?: number;
+            /** @description Full flat price, summed over `caliban/auto` events that carry both prices (cache hits at their full price) */
+            flat_price_usd?: number;
+            /** @description What those events were billed: the flat price on misses, the discounted price on cache hits */
+            billed_usd?: number;
+            /** @description What `caliban/auto` cache hits saved customers: flat_price_usd - billed_usd over hits */
+            auto_saved_usd?: number;
+            /** @description Sum over the same events (0 on cache hits) */
+            routed_model_cost_usd?: number;
+            /** @description billed_usd - routed_model_cost_usd */
+            margin_usd?: number;
         };
         Route: {
             intent: string;
@@ -2193,9 +5476,9 @@ export interface components {
             /** Format: date-time */
             ts: string;
             tenant_id?: string | null;
-            /** @description e.g. admin, system (seed) */
+            /** @description The user as `email <issuer#subject>`, `break_glass` (bootstrap token), `system`, or `anonymous` (failed logins) */
             actor: string;
-            /** @description e.g. tenant.create, api_key.create, provider_key.delete, routes.set, store.seed */
+            /** @description e.g. tenant.create, api_key.create, provider_key.delete, routes.set, store.seed, auth.login, auth.logout, auth.login_failed, auth.break_glass, role_binding.create */
             action: string;
             target?: string | null;
             detail: {
@@ -2214,10 +5497,104 @@ export interface components {
             } | null;
             chain_verified: boolean;
         };
+        /** @enum {string} */
+        Role: "owner" | "admin" | "auditor" | "tenant_admin" | "developer" | "viewer" | "billing";
+        /** @enum {string} */
+        Permission: "tenants.create" | "catalog.read" | "catalog.write" | "providers.probe" | "audit.read" | "rbac.read" | "rbac.write" | "tenant.read" | "tenant.write" | "tenant.delete" | "api_keys.read" | "api_keys.write" | "provider_keys.read" | "provider_keys.write" | "routes.read" | "routes.write" | "datasources.read" | "datasources.write" | "ontology.read" | "ontology.review" | "nodes.read" | "nodes.write" | "nodes.publish" | "nodes.run" | "tools.read" | "tools.write" | "tools.approve" | "usage.read";
+        RoleInfo: {
+            role: components["schemas"]["Role"];
+            /** @enum {string} */
+            scope: "deployment" | "tenant";
+            description: string;
+            permissions: components["schemas"]["Permission"][];
+        };
+        User: {
+            id: string;
+            issuer: string;
+            subject: string;
+            email?: string | null;
+            name?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_login_at?: string | null;
+            /** @description Bindings naming this user (GET /users only) */
+            role_bindings?: components["schemas"]["RoleBinding"][];
+            /** @description GET /users only */
+            active_sessions?: number;
+        };
+        RoleBinding: {
+            id: string;
+            /** @enum {string} */
+            subject_kind: "user" | "group";
+            /** @description A user id, or a group name as the identity provider sends it */
+            subject: string;
+            role: components["schemas"]["Role"];
+            tenant_id?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            created_by: string;
+        };
+        RoleBindingCreate: {
+            /** @enum {string} */
+            subject_kind: "user" | "group";
+            subject: string;
+            role: components["schemas"]["Role"];
+            tenant_id?: string | null;
+        };
+        GroupMapping: {
+            group: string;
+            role: components["schemas"]["Role"];
+            tenant_id?: string | null;
+            /** @enum {string} */
+            source: "config";
+        };
+        RoleBindingList: {
+            bindings: components["schemas"]["RoleBinding"][];
+            group_mappings: components["schemas"]["GroupMapping"][];
+            groups_claim?: string | null;
+        };
+        AuthConfig: {
+            sso_enabled: boolean;
+            break_glass_enabled: boolean;
+            login_url?: string | null;
+        };
+        Me: {
+            authenticated: boolean;
+            /** @enum {string} */
+            method: "session" | "bearer" | "break_glass";
+            actor: string;
+            user?: components["schemas"]["User"] | null;
+            groups?: string[];
+            roles: {
+                role: components["schemas"]["Role"];
+                tenant_id?: string;
+            }[];
+            permissions: {
+                /** @description Held deployment-wide; tenant-scoped ones here apply to every tenant. */
+                deployment: components["schemas"]["Permission"][];
+                tenants: {
+                    [key: string]: components["schemas"]["Permission"][];
+                };
+            };
+            /** @description Sessions only: send as X-CSRF-Token on writes */
+            csrf_token?: string;
+            session?: {
+                id?: string;
+                /** Format: date-time */
+                created_at?: string;
+                /** Format: date-time */
+                expires_at?: string;
+            };
+        };
         SignedSnapshot: {
             /** @description First 16 hex chars of sha256(public key) */
             key_id: string;
-            /** @description base64 of JSON {version, issued_at_ms, config}; config has the caliban.toml structure */
+            /**
+             * @description base64 of JSON {version, issued_at_ms, config, kek_ids}; config has the caliban.toml structure. kek_ids
+             *     (omitted when empty) lists the KEKs (`kek_` fingerprints) that sealed the secrets in config: what a router
+             *     needs in its keyring to open them.
+             */
             payload: string;
             /** @description base64 Ed25519 signature */
             signature: string;
@@ -2298,6 +5675,8 @@ export interface components {
     parameters: {
         TenantId: string;
         ProviderId: string;
+        NodeName: string;
+        NodeVersion: number;
         TenantQuery: string;
     };
     requestBodies: never;

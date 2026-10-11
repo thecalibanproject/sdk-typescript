@@ -298,8 +298,9 @@ export class CalibanAdmin {
   };
 
   readonly nodes = {
+    /** Every version of every node (with its spec). */
     list: (query: { tenant_id?: string } = {}, opts?: AdminRequestOptions): Promise<Node[]> =>
-      unwrap(this.raw.GET('/api/v1/nodes', { ...opts, params: { query } })),
+      unwrap(this.raw.GET('/api/v1/nodes', { ...opts, params: { query } })) as Promise<Node[]>,
     /** Create a new node version. The server validates `spec` against node.schema.json. */
     create: (body: NodeCreate, opts?: AdminRequestOptions): Promise<Node> =>
       unwrap(
