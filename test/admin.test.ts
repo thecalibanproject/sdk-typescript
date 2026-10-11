@@ -544,3 +544,60 @@ describe('CalibanAdmin node evals', () => {
     expect(bad).toBeDefined();
   });
 });
+
+describe('CalibanAdmin console runs and inbox', () => {
+  const R = 'http://cp:8081/api/v1/tenants/t_1/runs';
+  const consoleRun = {
+    id: 'run_1',
+    object: 'node.run',
+    node: 'desk',
+    version: 2,
+    status: 'input_required',
+    steps: [],
+    budget: {},
+    content_visible: false,
+    input_labels: ['caller'],
+    awaiting: { step: 'write#0@approve', kind: 'approval', question: null },
+    created_at: 'x',
+  };
+
+  it('lists, gets, answers and cancels runs', async () => {
+    const m = mockFetch(
+      json({ object: 'list', data: [], next_cursor: null }),
+      json(consoleRun),
+      json({ ...consoleRun, status: 'running', awaiting: null }, { status: 202 }),
+      json({ ...consoleRun, status: 'running', cancel_requested: true }, { status: 202 }),
+      json({ error: { message: 'run ended', type: 'conflict', code: 'run_already_ended' } }, { status: 409 }),
+    );
+    const a = admin(m.fetch);
+    await a.runs.list('t_1', { node: 'desk', status: 'input_required', limit: 5 });
+    expect(m.calls[0]!.url).toBe(`${R}?node=desk&status=input_required&limit=5`);
+    const run = await a.runs.get('t_1', 'run_1');
+    expect(run.input_labels).toEqual(['caller']);
+    expect(run.awaiting?.kind).toBe('approval');
+    expect(m.calls[1]).toMatchObject({ method: 'GET', url: `${R}/run_1` });
+    await a.runs.input('t_1', 'run_1', { answer: { approve: false }, step: 'write#0@approve' });
+    expect(m.calls[2]).toMatchObject({ method: 'POST', url: `${R}/run_1/input` });
+    expect(JSON.parse(m.calls[2]!.body!)).toEqual({ answer: { approve: false }, step: 'write#0@approve' });
+    expect((await a.runs.cancel('t_1', 'run_1')).cancel_requested).toBe(true);
+    expect(m.calls[3]).toMatchObject({ method: 'POST', url: `${R}/run_1/cancel` });
+    await expect(a.runs.cancel('t_1', 'run_1')).rejects.toMatchObject({ status: 409, code: 'run_already_ended' });
+  });
+
+  it('lists the inbox with structured approvals', async () => {
+    const item = {
+      run_id: 'run_1',
+      node: 'desk',
+      version: 2,
+      step: 'write#0@approve',
+      kind: 'approval',
+      question: 'Allow erp/approve?',
+      waiting_since: 'x',
+      approval: { tool: 'mcp://erp/approve#sha256:ab', effect: 'write', labels: ['caller'], arguments: { invoice: 'INV-1' } },
+    };
+    const m = mockFetch(json({ object: 'list', content_visible: true, data: [item] }));
+    const inbox = await admin(m.fetch).inbox.list('t_1');
+    expect(inbox.data[0]?.approval?.labels).toEqual(['caller']);
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/tenants/t_1/inbox' });
+  });
+});

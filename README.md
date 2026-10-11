@@ -322,6 +322,8 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | `evalPolicy` | `get`, `put` (per node: the promotion bar) |
 | `evals` | `start`, `list`, `get`, `trials`, `cancel`, `gate` |
 | `evalKey` | `get`, `rotate` (the tenant's eval key) |
+| `runs` | `list`, `get`, `input`, `cancel` (a tenant's node runs, as the console sees them) |
+| `inbox` | `list` (runs waiting for a human) |
 | `usage` | `get` |
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
@@ -378,6 +380,19 @@ const { totals } = await admin.usage.get({ tenant_id: tenant.id });
 console.log(`${totals.semantic_cache_hits ?? 0} of ${totals.cache_hits ?? 0} hits were semantic`);
 console.log(`auto margin: $${(totals.margin_usd ?? 0).toFixed(4)} over ${totals.auto_requests ?? 0} requests`);
 console.log(`${totals.auto_cache_hits ?? 0} auto cache hits saved customers $${(totals.auto_saved_usd ?? 0).toFixed(4)}`);
+```
+
+#### Node runs and the inbox
+
+The admin client sees a tenant's node runs as the console does: `runs.list(tenantId, query)` and `runs.get(tenantId, runId)` need `runs.read`, and include content (`input`, `output`, step outputs, the question) only with `runs.data` (`content_visible`). `runs.input()` and `runs.cancel()` need `runs.answer` and are recorded with the caller's identity (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`). `inbox.list(tenantId)` lists the runs waiting for a human, oldest wait first; an approval carries `approval` (the tool, its effect, the untrusted taint labels its arguments carry, and the `arguments` with `runs.data`).
+
+```ts
+const { data } = await admin.inbox.list(tenant.id);
+for (const item of data.filter((i) => i.kind === 'approval')) {
+  const ok = item.approval?.labels?.every((l) => l === 'datasource') ?? false;
+  await admin.runs.input(tenant.id, item.run_id, { answer: { approve: ok }, step: item.step });
+}
+await admin.runs.cancel(tenant.id, stuckRunId); // 409 if it already ended otherwise
 ```
 
 #### Node evals

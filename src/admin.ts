@@ -115,6 +115,24 @@ export type EvalKey =
 export type EvalKeyRotation =
   paths['/api/v1/tenants/{tenantId}/eval-key/rotate']['post']['responses'][200]['content']['application/json'];
 
+// ── Node runs and the inbox (console) ──
+
+/** A run as the console sees it (contract: `ConsoleRun`): content (`input`, `output`, step outputs) only with `runs.data`. */
+export type ConsoleRun = Schemas['ConsoleRun'];
+/** Query of `runs.list()` (admin). `status` is comma separated; times are RFC 3339. */
+export type ConsoleRunListQuery = NonNullable<paths['/api/v1/tenants/{tenantId}/runs']['get']['parameters']['query']>;
+/** A page of run summaries (contract: `NodeRunList`). */
+export type ConsoleRunList = Schemas['NodeRunList'];
+/** Body of `runs.input()` (admin): `answer` is any JSON value (`{ approve: boolean }` for an approval); `step` defaults to the awaited one. */
+export type ConsoleRunInput =
+  paths['/api/v1/tenants/{tenantId}/runs/{runId}/input']['post']['requestBody']['content']['application/json'];
+/** Result of `inbox.list()`: runs waiting for a human, oldest wait first. */
+export type Inbox = paths['/api/v1/tenants/{tenantId}/inbox']['get']['responses'][200]['content']['application/json'];
+/** One waiting human step: a `question`, or an `approval` of a gated call (`approval` says what it would do). */
+export type InboxItem = Inbox['data'][number];
+/** What a gated call would do (`kind: 'approval'`): tool, effect, taint labels, and `arguments` with `runs.data`. */
+export type InboxApproval = NonNullable<InboxItem['approval']>;
+
 export const DEFAULT_CONTROL_PLANE_URL = 'http://localhost:8081';
 
 export interface CalibanAdminOptions {
@@ -504,6 +522,44 @@ export class CalibanAdmin {
      */
     rotate: (tenantId: string, opts?: AdminRequestOptions): Promise<EvalKeyRotation> =>
       unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/eval-key/rotate', { ...opts, params: { path: { tenantId } } })),
+  };
+
+  /**
+   * A tenant's node runs, as the console sees them (needs a node journal, else 503). Answers and
+   * cancellations are recorded with the caller's identity in the audit chain.
+   */
+  readonly runs = {
+    /** One page, newest first (`runs.read`). Pass `next_cursor` as `cursor` for the next. */
+    list: (tenantId: string, query: ConsoleRunListQuery = {}, opts?: AdminRequestOptions): Promise<ConsoleRunList> =>
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/runs', { ...opts, params: { path: { tenantId }, query } })),
+    /** Status, budget, cost, usage and steps (`runs.read`); content too with `runs.data` (`content_visible`). */
+    get: (tenantId: string, runId: string, opts?: AdminRequestOptions): Promise<ConsoleRun> =>
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/runs/{runId}', { ...opts, params: { path: { tenantId, runId } } })),
+    /**
+     * Answer a question, or approve (`{ approve: true }`) or deny (`{ approve: false }`) a gated
+     * call (`runs.answer`; audited as `node.run.answer`, `node.write.approve` or `node.write.deny`).
+     * Throws a 409 `CalibanAPIError` if the run is not waiting (or not for `step`).
+     */
+    input: (tenantId: string, runId: string, body: ConsoleRunInput, opts?: AdminRequestOptions): Promise<ConsoleRun> =>
+      unwrap(
+        this.raw.POST('/api/v1/tenants/{tenantId}/runs/{runId}/input', { ...opts, params: { path: { tenantId, runId } }, body }),
+      ),
+    /**
+     * Cancel a run (`runs.answer`; audited as `node.run.cancel`). A waiting run ends at once; a
+     * running one stops at its next step (`cancel_requested: true`). Throws a 409 `CalibanAPIError`
+     * (`run_already_ended`) if it ended otherwise.
+     */
+    cancel: (tenantId: string, runId: string, opts?: AdminRequestOptions): Promise<ConsoleRun> =>
+      unwrap(
+        this.raw.POST('/api/v1/tenants/{tenantId}/runs/{runId}/cancel', { ...opts, params: { path: { tenantId, runId } } }),
+      ),
+  };
+
+  /** Runs waiting for a human: questions and approvals of gated calls. */
+  readonly inbox = {
+    /** Oldest wait first (`runs.read`; questions and approval `arguments` with `runs.data`). */
+    list: (tenantId: string, opts?: AdminRequestOptions): Promise<Inbox> =>
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/inbox', { ...opts, params: { path: { tenantId } } })),
   };
 
   readonly usage = {
