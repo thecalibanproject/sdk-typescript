@@ -286,10 +286,45 @@ export interface RequestOptions {
   /**
    * Sent as the `Idempotency-Key` header (replacing one in `headers`). It marks this POST as
    * safe to retry, so it is retried like a GET (502 included). Use a fresh unique value per
-   * logical request. The gateway does not deduplicate on this key yet, so a retry after a
-   * 502 can still run the request twice upstream.
+   * logical request. The gateway deduplicates on it (see the README): a retry of a run start
+   * returns the run the first request created.
    */
   idempotencyKey?: string;
   /** Extra JSON fields merged into the request body (after typed params, before `caliban`). */
   extraBody?: Record<string, unknown>;
+}
+
+// ── Node runs (data plane) ──
+
+type ContractRunCreate = paths['/v1/nodes/{nodeName}/runs']['post']['requestBody']['content']['application/json'];
+/**
+ * Body of `runs.create()` (contract: `POST /v1/nodes/{nodeName}/runs`). `input` is checked
+ * against the node's `prompt.input_schema`; `chat.messages` instead maps chat messages to the
+ * input. `budget` can only lower the version's budget.
+ */
+export type RunCreateParams = ContractRunCreate;
+export type RunCreateParamsNonStreaming = RunCreateParams & { stream?: false | undefined };
+export type RunCreateParamsStreaming = RunCreateParams & { stream: true };
+/** A node run (contract: `NodeRun`). */
+export type NodeRun = Schemas['NodeRun'];
+/** `pending`, `running`, `sleeping`, `input_required`, `succeeded`, `failed`, `budget_exhausted` or `cancelled`. */
+export type RunStatus = Schemas['RunStatus'];
+export type RunStep = Schemas['RunStep'];
+export type RunUsage = Schemas['RunUsage'];
+/** One event of a run's stream (contract: `RunEvent`); `run` on the last event of a stream. */
+export type RunEvent = Schemas['RunEvent'];
+export type RunEventType = RunEvent['type'];
+/** A run in `runs.list()` (no content, no steps). */
+export type NodeRunSummary = Schemas['NodeRunSummary'];
+/** A page of `runs.list()`. */
+export type NodeRunList = Schemas['NodeRunList'];
+/** Query of `runs.list()`. `status` is comma separated; times are RFC 3339. */
+export type RunListQuery = NonNullable<paths['/v1/runs']['get']['parameters']['query']>;
+/** Body of `runs.input()`: `answer` is any JSON value; `step` defaults to the awaited one. */
+export type RunInputParams = paths['/v1/runs/{runId}/input']['post']['requestBody']['content']['application/json'];
+
+/** Options for `runs.events()`: request options plus where to resume. */
+export interface RunEventsOptions extends Omit<RequestOptions, 'idempotencyKey' | 'extraBody'> {
+  /** Resume after this event number (e.g. a previous stream's `lastEventId`). Default: from the start. */
+  after?: number;
 }

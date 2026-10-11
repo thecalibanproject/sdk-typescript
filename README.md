@@ -176,6 +176,12 @@ new CalibanClient(options?: CalibanClientOptions)
 | `embeddings.create(params, options?)` | `POST /v1/embeddings` | `WithMeta<CreateEmbeddingResponse>` |
 | `rerank.create(params, options?)` | `POST /v1/rerank` | `WithMeta<RerankResponse>` |
 | `models.list(options?)` | `GET /v1/models` | `WithMeta<ModelList>` |
+| `runs.create(nodeName, params, options?)` | `POST /v1/nodes/{nodeName}/runs` | `WithMeta<NodeRun>`, or a `RunEventStream` when `stream: true` |
+| `runs.get(runId, options?)` | `GET /v1/runs/{runId}` | `WithMeta<NodeRun>` |
+| `runs.list(query?, options?)` | `GET /v1/runs` | `WithMeta<NodeRunList>` |
+| `runs.events(runId, { after?, ...options })` | `GET /v1/runs/{runId}/events` | `RunEventStream` |
+| `runs.input(runId, { answer, step? }, options?)` | `POST /v1/runs/{runId}/input` | `WithMeta<NodeRun>` |
+| `runs.cancel(runId, options?)` | `POST /v1/runs/{runId}/cancel` | `WithMeta<NodeRun>` |
 
 Every method takes the same `RequestOptions`:
 
@@ -218,6 +224,35 @@ for (const r of res.results) console.log(r.relevance_score, docs[r.index]); // b
 ```
 
 `results` keep the server's order (highest `relevance_score` first) and `index` points into `documents`. The SDK rejects a non-string query, an empty or non-string `documents` array and an invalid `top_n` before sending. Text sent outside the trust boundary is PII-masked; returned documents are always your originals.
+
+**Node runs.** Run a published node with a tenant key the node is allowed for (its node allowlist, or every published node of the tenant without one). The input is checked against the node's `prompt.input_schema`.
+
+```ts
+// Sync (default): resolves when the run ends or waits for a human, or after the server's
+// wait (at most CALIBAN_NODE_SYNC_WAIT_SECS, or wait_s) with the run so far.
+let run = await caliban.runs.create('invoice-triage', { input: { invoice_id: 'INV-42' } }, { idempotencyKey: 'inv-42' });
+
+if (run.status === 'input_required') {
+  console.log(run.awaiting?.question);
+  run = await caliban.runs.input(run.id, { answer: 'approved by finance' }); // resumes the run
+}
+while (['pending', 'running', 'sleeping'].includes(run.status)) {
+  await new Promise((r) => setTimeout(r, 1000));
+  run = await caliban.runs.get(run.id);
+}
+console.log(run.status, run.output, run.cost_usd);
+
+// Stream the run's events (SSE) instead.
+const stream = await caliban.runs.create('invoice-triage', { input: { invoice_id: 'INV-43' }, stream: true });
+for await (const ev of stream) console.log(ev.id, ev.type, ev.data); // step.started, step.finished, ...
+console.log(stream.run?.status); // the run, from the last event
+```
+
+- `async: true` answers at once with the pending run; poll `runs.get()` or follow `runs.events()`. `version` runs a published version other than the live one; `budget` can only lower the version's budget for this run; `chat: { messages }` replaces `input` with chat messages.
+- A `RunEventStream` yields `RunEvent`s (`run.created`, `step.started`, `step.finished`, `run.input_required`, `run.sleeping`, `run.input_received`, `run.cancel_requested`, `run.finished`). The server ends it after `run.finished`, or after `run.input_required` while the run waits; that last event carries the run (`stream.run`, or `await stream.finalRun()`). Events never carry step content. `stream.runId` is the `Caliban-Run-Id` header. The timeout covers the time until headers arrive; the stream is not retried or resumed by itself: resume with `runs.events(runId, { after: stream.lastEventId })`.
+- `runs.input()` answers the step the run waits for (`awaiting.step`, or `step`). A step named `<step>@approve` asks to approve a write whose arguments carry untrusted taint labels: answer `{ approve: true }` or `{ approve: false }`. Not waiting for that step is a `409` (`run_not_awaiting_input`).
+- `runs.cancel()` cancels a waiting run at once and asks a running one to stop at its next step (`cancel_requested: true`); a run that already ended otherwise is a `409` (`run_already_ended`).
+- With `idempotencyKey`, a retried start returns the run the first request created (`idempotent-replayed: true`, `stream.replayed`) and starts nothing; the same key with another body is a `422` (`idempotency_key_reused`). Without one, a run start is a POST like any other: retried on 429 and 503 only.
 
 ### `CalibanAdmin` (control plane)
 
@@ -558,7 +593,7 @@ What is retried depends on whether the request is safe to repeat:
 
 - A POST is never retried on 500, 502 or 504, because the gateway may already have run the request and billed it upstream. The same goes for a reset or timeout after the request was sent. In browsers fetch does not say whether the request was sent, so a failed POST is not retried there.
 - Network failures are not retried by default for any request; `retryOnNetworkError: true` turns that on within the limits above.
-- To make a POST retryable like a GET, pass `idempotencyKey` (or an `Idempotency-Key` header). The SDK never sends one on its own; use a fresh key per logical request and the same key for its retries. The gateway deduplicates on it for `chat.completions`, `messages`, `embeddings` and `rerank`: the first request runs (to completion, even if the connection drops); a retry after it finished gets the stored response for 24 h (header `idempotent-replayed: true`, nothing charged again; streams are replayed as one SSE body); a retry while it is still running gets `409` with code `idempotency_key_in_use` and `retry-after: 1`, which the SDK does not retry, so catch it and retry later; the same key with a different body gets `422` (`idempotency_key_reused`). A failed request frees its key. The admin API does not deduplicate: there a retried POST after a 502 can run twice.
+- To make a POST retryable like a GET, pass `idempotencyKey` (or an `Idempotency-Key` header). The SDK never sends one on its own; use a fresh key per logical request and the same key for its retries. The gateway deduplicates on it for `chat.completions`, `messages`, `embeddings` and `rerank`: the first request runs (to completion, even if the connection drops); a retry after it finished gets the stored response for 24 h (header `idempotent-replayed: true`, nothing charged again; streams are replayed as one SSE body); a retry while it is still running gets `409` with code `idempotency_key_in_use` and `retry-after: 1`, which the SDK does not retry, so catch it and retry later; the same key with a different body gets `422` (`idempotency_key_reused`). A failed request frees its key. Run starts (`runs.create`) are deduplicated too, per tenant and for as long as the run is kept: a repeat returns the run the first request created. The admin API does not deduplicate: there a retried POST after a 502 can run twice.
 - Setting `retryOnStatus` explicitly applies your list to every request as-is, POSTs included. For example, `retry: { retryOnStatus: [429, 502, 503] }` restores the old behaviour of retrying POSTs on 502.
 - Once a stream has started, nothing is retried.
 

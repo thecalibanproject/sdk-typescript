@@ -3,6 +3,7 @@ import { readEnv, resolveFetch, trimTrailingSlash } from './internal/env.js';
 import { sendWithRetry } from './internal/http.js';
 import { attachMeta, parseResponseMeta } from './meta.js';
 import { IDEMPOTENCY_KEY_HEADER, isIdempotentRequest, resolveRetryPolicy, type RetryOptions, type RetryPolicy } from './retry.js';
+import { Runs } from './runs.js';
 import { ChatCompletionStream } from './streaming.js';
 import type {
   CalibanExtension,
@@ -239,6 +240,8 @@ export class CalibanClient {
   readonly embeddings: Embeddings;
   readonly rerank: Rerank;
   readonly models: { list(options?: RequestOptions): Promise<WithMeta<ModelList>> };
+  /** Node runs: `create`, `get`, `list`, `events` (SSE), `input`, `cancel`. */
+  readonly runs: Runs;
 
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch;
@@ -264,6 +267,7 @@ export class CalibanClient {
     this.chat = { completions: new Completions(this) };
     this.embeddings = new Embeddings(this);
     this.rerank = new Rerank(this);
+    this.runs = new Runs(this);
     this.models = {
       list: async (opts: RequestOptions = {}) => {
         const { response, lifetime } = await this._send('/models', { method: 'GET', accept: 'application/json', options: opts });
