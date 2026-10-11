@@ -33,9 +33,10 @@
   },
   "packageManager": "pnpm@9.15.0",
   "scripts": {
-    "gen:api": "openapi-typescript ../core/api/openapi.yaml --default-non-nullable false --output src/generated/schema.ts",
+    "gen:api": "node scripts/gen-api.mjs",
     "gen:schemas": "node scripts/gen-schemas.mjs",
     "gen": "pnpm gen:api && pnpm gen:schemas",
+    "check:generated": "CALIBAN_REQUIRE_CORE=1 vitest run test/generated.test.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

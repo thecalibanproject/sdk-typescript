@@ -604,7 +604,10 @@ The API and node types are generated from the [core](https://github.com/thecalib
 pnpm gen:api       # core/api/openapi.yaml         -> src/generated/schema.ts
 pnpm gen:schemas   # core/schemas/node.schema.json -> src/generated/node.ts
 pnpm gen           # both
+pnpm check:generated   # fail if src/generated/ differs from what core produces
 ```
+
+Set `CALIBAN_CORE_DIR` if `core` is somewhere else. `pnpm test` runs the same drift check (`test/generated.test.ts`) when it finds `core` and skips it otherwise; `pnpm check:generated` and CI (`CALIBAN_REQUIRE_CORE=1`, with `core`'s `schemas/` and `api/` checked out next to this repo) fail instead, so a contract change in `core` fails CI here until the generated files are regenerated and committed.
 
 ## Licence
 
