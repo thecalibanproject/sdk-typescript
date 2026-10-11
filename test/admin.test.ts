@@ -1,5 +1,19 @@
-import { describe, expect, it } from 'vitest';
-import { CalibanAdmin, CalibanAPIError, CalibanConnectionError, defineNode } from '../src/index.js';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import {
+  CalibanAdmin,
+  CalibanAPIError,
+  CalibanConnectionError,
+  defineNode,
+  type Eval,
+  type EvalCheck,
+  type EvalGate,
+  type EvalPolicy,
+  type EvalStart,
+  type EvalStatus,
+  type EvalSuite,
+  type EvalTrial,
+  type GoldenCase,
+} from '../src/index.js';
 import { fastRetry, json, mockFetch } from './helpers.js';
 
 const tenant = { id: 't_1', name: 'Acme', region: null, pii_default: 'reversible', created_at: '2026-10-02T00:00:00Z' };
@@ -333,5 +347,139 @@ describe('CalibanAdmin', () => {
 
   it('requires a token', () => {
     expect(() => new CalibanAdmin({ token: '', fetch: mockFetch().fetch })).toThrow(/Missing admin token/);
+  });
+});
+
+const N = 'http://cp:8081/api/v1/tenants/t_1/nodes/desk';
+const evalBody = {
+  id: 'ev_1',
+  object: 'node.eval',
+  node: 'desk',
+  version: 2,
+  hash: 'sha256:aa',
+  suite: 'golden',
+  k: 3,
+  status: 'pending',
+  case_count: 2,
+  created_at: '2026-10-11T00:00:00Z',
+};
+const goldenCases: GoldenCase[] = [
+  {
+    id: 'chest',
+    input: { case: 'Chest pain since Tuesday' },
+    answers: { clarify: 'two days, nobody in danger' },
+    checks: [
+      { type: 'json_schema', schema: { type: 'object', required: ['urgency'] } },
+      { type: 'contains', value: ['clinical'] },
+      { type: 'llm_judge', rubric: 'Does the recommendation fit the case?', threshold: 0.7 },
+    ],
+  },
+  { id: 'refund', input: { case: 'Refund my invoice' }, expected: 'billing' },
+];
+
+describe('CalibanAdmin node evals', () => {
+  it('reads, replaces and deletes a golden set', async () => {
+    const set = { object: 'node.golden_set', node: 'desk', version: 2, hash: 'sha256:bb', case_count: 2, updated_at: 'x', updated_by: 'u', content_visible: true, cases: goldenCases };
+    const m = mockFetch(json(set), json(set), new Response(null, { status: 204 }));
+    const a = admin(m.fetch);
+    const got = await a.goldenSets.get('t_1', 'desk', 2);
+    expect(got.cases?.[0]?.checks?.[0]).toEqual({ type: 'json_schema', schema: { type: 'object', required: ['urgency'] } });
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${N}/versions/2/golden-set` });
+    const put = await a.goldenSets.put('t_1', 'desk', 2, { cases: goldenCases });
+    expect(put.case_count).toBe(2);
+    expect(m.calls[1]).toMatchObject({ method: 'PUT', url: `${N}/versions/2/golden-set` });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ cases: goldenCases });
+    await expect(a.goldenSets.delete('t_1', 'desk', 2)).resolves.toBeUndefined();
+    expect(m.calls[2]).toMatchObject({ method: 'DELETE', url: `${N}/versions/2/golden-set` });
+  });
+
+  it('retries a golden set PUT on 502 (PUT is idempotent)', async () => {
+    const m = mockFetch(new Response('', { status: 502 }), json({ object: 'node.golden_set', case_count: 1 }));
+    await admin(m.fetch).goldenSets.put('t_1', 'desk', 2, { cases: [{ id: 'a', input: 'x', expected: 'y' }] });
+    expect(m.calls.map((c) => c.method)).toEqual(['PUT', 'PUT']);
+  });
+
+  it('gets and sets the promotion bar', async () => {
+    const policy: EvalPolicy = {
+      golden: { min_pass_k: 0.9, min_k: 3, max_cost_per_success_usd: 0.02, max_p95_latency_ms: 8000 },
+      injection: { min_pass_rate: 1 },
+    };
+    const view = { object: 'node.eval_policy', node: 'desk', policy, injection_bar: 1, updated_at: 'x', updated_by: 'u' };
+    const m = mockFetch(json(view), json(view), new Response(null, { status: 200 }));
+    const a = admin(m.fetch);
+    expect((await a.evalPolicy.get('t_1', 'desk')).injection_bar).toBe(1);
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${N}/eval-policy` });
+    expect((await a.evalPolicy.put('t_1', 'desk', policy))?.policy).toEqual(policy);
+    expect(m.calls[1]).toMatchObject({ method: 'PUT', url: `${N}/eval-policy` });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual(policy);
+    // A server that answers without a body.
+    await expect(a.evalPolicy.put('t_1', 'desk', policy)).resolves.toBeUndefined();
+  });
+
+  it('starts an eval with or without api_key_id', async () => {
+    const m = mockFetch(json(evalBody, { status: 202 }));
+    const a = admin(m.fetch);
+    const started = await a.evals.start('t_1', 'desk', 2, { suite: 'golden', api_key_id: 'k1', k: 3, judge_model: 'local/qwen3-8b' });
+    expect(started.status).toBe('pending');
+    expect(m.calls[0]).toMatchObject({ method: 'POST', url: `${N}/versions/2/evals` });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ suite: 'golden', api_key_id: 'k1', k: 3, judge_model: 'local/qwen3-8b' });
+    // A server with a managed eval key does not need one.
+    await a.evals.start('t_1', 'desk', 2, { suite: 'injection', input_case: 'chest' });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ suite: 'injection', input_case: 'chest' });
+  });
+
+  it('does not retry an eval start on 502 unless it carries an Idempotency-Key', async () => {
+    const m = mockFetch(new Response('', { status: 502 }), json(evalBody, { status: 202 }));
+    await expect(admin(m.fetch).evals.start('t_1', 'desk', 2, { suite: 'golden' })).rejects.toMatchObject({ status: 502 });
+    expect(m.calls).toHaveLength(1);
+  });
+
+  it('lists, gets, cancels evals and reads trials', async () => {
+    const trial = { case: 'chest', trial: 0, run_id: 'run_1', status: 'passed', cost_usd: 0.001, verdict: { checks: 3 } };
+    const m = mockFetch(
+      json({ object: 'list', data: [evalBody], next_cursor: 'c2' }),
+      json({ ...evalBody, status: 'succeeded', summary: { pass_hat_k: 1 }, trials: [trial] }),
+      json({ ...evalBody, trials: [trial] }),
+      json({ ...evalBody, status: 'running', cancel_requested: true }, { status: 202 }),
+      json({ error: { message: 'eval ended', type: 'conflict', code: 'eval_already_ended' } }, { status: 409 }),
+    );
+    const a = admin(m.fetch);
+    const page = await a.evals.list('t_1', { node: 'desk', version: 2, suite: 'golden', status: 'succeeded,failed', limit: 10, cursor: 'c1' });
+    expect(page.next_cursor).toBe('c2');
+    expect(m.calls[0]!.url).toBe(
+      'http://cp:8081/api/v1/tenants/t_1/evals?node=desk&version=2&suite=golden&status=succeeded%2Cfailed&limit=10&cursor=c1',
+    );
+    const ev = await a.evals.get('t_1', 'ev_1');
+    expect(ev.summary?.pass_hat_k).toBe(1);
+    expect(m.calls[1]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/tenants/t_1/evals/ev_1' });
+    expect(await a.evals.trials('t_1', 'ev_1')).toEqual([trial]);
+    const cancelled = await a.evals.cancel('t_1', 'ev_1');
+    expect(cancelled.cancel_requested).toBe(true);
+    expect(m.calls[3]).toMatchObject({ method: 'POST', url: 'http://cp:8081/api/v1/tenants/t_1/evals/ev_1/cancel' });
+    await expect(a.evals.cancel('t_1', 'ev_1')).rejects.toMatchObject({ status: 409, code: 'eval_already_ended' });
+  });
+
+  it('asks the gate', async () => {
+    const m = mockFetch(
+      json({ node: 'desk', version: 2, has_write_tools: true, allowed: false, evidence: null, problems: [{ kind: 'eval_gate', message: 'no injection eval' }] }),
+    );
+    const gate = await admin(m.fetch).evals.gate('t_1', 'desk', 2);
+    expect(gate.allowed).toBe(false);
+    expect(gate.problems?.[0]?.kind).toBe('eval_gate');
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${N}/versions/2/gate` });
+  });
+
+  it('types follow the contract, with api_key_id optional', () => {
+    expectTypeOf<EvalStart['api_key_id']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<EvalStart['suite']>().toEqualTypeOf<EvalSuite>();
+    expectTypeOf<EvalSuite>().toEqualTypeOf<'golden' | 'injection'>();
+    expectTypeOf<EvalStatus>().toEqualTypeOf<'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'>();
+    expectTypeOf<Extract<EvalCheck, { type: 'json_schema' }>['schema']>().toEqualTypeOf<Record<string, unknown>>();
+    expectTypeOf<Eval['summary']>().toEqualTypeOf<Record<string, unknown> | null | undefined>();
+    expectTypeOf<NonNullable<EvalTrial['verdict']>>().toEqualTypeOf<Record<string, unknown>>();
+    expectTypeOf<NonNullable<EvalGate['problems']>>().toEqualTypeOf<Record<string, unknown>[]>();
+    // @ts-expect-error a check needs a known type
+    const bad: EvalCheck = { type: 'similar', value: 'x' };
+    expect(bad).toBeDefined();
   });
 });

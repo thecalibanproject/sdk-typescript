@@ -273,6 +273,9 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | `datasources` | `list`, `create`, `delete`, `introspect` |
 | `ontology` | `get`, `review` |
 | `nodes` | `list`, `create`, `delete` |
+| `goldenSets` | `get`, `put`, `delete` (per node version) |
+| `evalPolicy` | `get`, `put` (per node: the promotion bar) |
+| `evals` | `start`, `list`, `get`, `trials`, `cancel`, `gate` |
 | `usage` | `get` |
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
@@ -330,6 +333,48 @@ console.log(`${totals.semantic_cache_hits ?? 0} of ${totals.cache_hits ?? 0} hit
 console.log(`auto margin: $${(totals.margin_usd ?? 0).toFixed(4)} over ${totals.auto_requests ?? 0} requests`);
 console.log(`${totals.auto_cache_hits ?? 0} auto cache hits saved customers $${(totals.auto_saved_usd ?? 0).toFixed(4)}`);
 ```
+
+#### Node evals
+
+A node version is evaluated before it is promoted: the **golden** suite runs each case of the version's golden set `k` times as ordinary node runs and reports pass^k (`pass_hat_k`, the share of cases whose `k` runs all passed), `pass_at_1`, cost per success and latency; the **injection** suite runs the version against sandboxed tools and reports the share of attacks blocked (`pass_rate`). The node's promotion bar decides what may be promoted, and a version with write tools always needs an injection eval. The endpoints are the core contract's `evals` tag; see core's `docs/evals.md` for the checks, metrics and gate rules.
+
+```ts
+const t = tenant.id;
+
+// 1. The golden set of version 2 (at most 200 cases; inputs are checked against prompt.input_schema).
+await admin.goldenSets.put(t, 'desk', 2, {
+  cases: [
+    {
+      id: 'chest',
+      input: { case: 'Chest pain since Tuesday' },
+      answers: { clarify: 'two days, nobody in danger' }, // scripted answers to human steps
+      checks: [
+        { type: 'json_schema', schema: { type: 'object', required: ['urgency'] } },
+        { type: 'llm_judge', rubric: 'Does the recommendation fit the case?', threshold: 0.7 },
+      ],
+    },
+    { id: 'refund', input: { case: 'Refund my invoice' }, expected: 'billing' }, // expected: an exact check
+  ],
+});
+
+// 2. The promotion bar (needs nodes.publish).
+await admin.evalPolicy.put(t, 'desk', { golden: { min_pass_k: 0.9, min_k: 3 }, injection: { min_pass_rate: 1 } });
+
+// 3. Evaluate the published version, then follow it.
+const ev = await admin.evals.start(t, 'desk', 2, { suite: 'golden', k: 3, api_key_id: keyId });
+const done = await admin.evals.get(t, ev.id); // status, summary (metrics only) and trials
+console.log(done.status, done.summary?.pass_hat_k, done.summary?.cost_per_success_usd);
+
+// 4. Would promotion pass?
+const gate = await admin.evals.gate(t, 'desk', 2);
+if (!gate.allowed) console.log(gate.problems);
+```
+
+- **`api_key_id` is optional in the SDK.** The current contract requires it: trials run as the tenant API key it names (it must be active and allowed to run the node; its quotas apply and its usage is the eval's). Core is moving evals to a per-tenant eval key the control plane manages; with such a server, leave it out. A server that still needs it answers `422` without it.
+- `evals.list(tenantId, { node, version, suite, status, limit, cursor })` returns one page (`data`, `next_cursor`), newest first, metrics and never content. `evals.trials(tenantId, evalId)` is `evals.get()` and its `trials`; each trial's `detail` (outputs, what the scorers said) is only there when the caller holds `runs.data`, and so are golden set `cases` (`content_visible`).
+- `evals.cancel()` ends a pending eval at once and asks a running one to stop (`cancel_requested: true`); an eval that already ended throws a `409`.
+- `goldenSets.put()` and `evalPolicy.put()` are `PUT`s, retried like a GET. `evals.start()` is a POST: retried on 429 and 503 only, unless you pass an `Idempotency-Key` header.
+- The control plane keeps evals next to the node journal; without one these calls answer `503`.
 
 **Deleting and revoking.** `tenants.delete(tenantId)`, `apiKeys.revoke(tenantId, keyId)`, `datasources.delete(tenantId, datasourceId)` and `nodes.delete(tenantId, nodeId)` resolve to `undefined` on success (204). An unknown id, an id that belongs to another tenant, or one that is already deleted throws a `CalibanAPIError` with `status: 404`, so a repeated delete throws too.
 
