@@ -469,7 +469,11 @@ export class CalibanAdmin {
   };
 
   readonly ontology = {
-    get: (query: { tenant_id?: string } = {}, opts?: AdminRequestOptions): Promise<Ontology> =>
+    /**
+     * The tenant's current ontology (Caliban Semantic Model). `tenant_id` is required: element ids
+     * are per tenant, and the server answers `400` without it.
+     */
+    get: (query: { tenant_id: string }, opts?: AdminRequestOptions): Promise<Ontology> =>
       unwrap(this.raw.GET('/api/v1/ontology', { ...opts, params: { query } })),
     /**
      * Approve, reject or deprecate one element of the tenant named in `body.tenant_id` (required:

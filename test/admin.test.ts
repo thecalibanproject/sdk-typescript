@@ -79,6 +79,10 @@ describe('CalibanAdmin', () => {
     expect(m.calls[0]!.url).toBe('http://cp:8081/api/v1/usage?tenant_id=t_1&limit=10');
     const onto = await a.ontology.get({ tenant_id: 't_1' });
     expect(onto.version).toBe(3);
+    expect(m.calls[1]!.url).toBe('http://cp:8081/api/v1/ontology?tenant_id=t_1');
+    // Element ids are per tenant: the server answers 400 without tenant_id, so it is required.
+    // @ts-expect-error tenant_id is required
+    expectTypeOf(a.ontology.get).toBeCallableWith({});
   });
 
   it('reviews ontology elements and starts introspection', async () => {
@@ -686,7 +690,7 @@ describe('CalibanAdmin: ontology bootstrap, intents and document collections', (
     const done = await a.datasources.introspection('ds/1');
     expect(m.calls[1]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/datasources/ds%2F1/introspection' });
     expect([done.status, done.proposed, done.skipped, done.version]).toEqual(['succeeded', 9, 2, 7]);
-    expectTypeOf(done.status).toEqualTypeOf<'running' | 'succeeded' | 'failed' | undefined>();
+    expectTypeOf(done.status).toEqualTypeOf<'running' | 'succeeded' | 'failed'>();
   });
 
   it('proposes elements and reviews a batch as one version', async () => {

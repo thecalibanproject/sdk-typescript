@@ -227,7 +227,7 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<OntologyReview['tenant_id']>().toEqualTypeOf<string>();
     expectTypeOf<OntologyDecision>().toEqualTypeOf<'approve' | 'reject' | 'deprecate'>();
     expectTypeOf<RagModel['trust_tier']>().toEqualTypeOf<TrustTier>();
-    expectTypeOf<IntrospectionJob['version']>().toEqualTypeOf<number | null | undefined>();
+    expectTypeOf<IntrospectionJob['version']>().toEqualTypeOf<number | null>();
     expectTypeOf<TenantIntentSet['source']>().toExtend<NonNullable<TenantIntent['source']>>();
   });
 

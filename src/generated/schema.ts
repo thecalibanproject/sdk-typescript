@@ -52,6 +52,8 @@ export interface paths {
                         "x-caliban-pii-entities"?: number;
                         /** @description Cost of this request in USD (non-streaming only; absent when the model has no price). */
                         "x-caliban-cost-usd"?: string;
+                        /** @description What the request is billed in USD (non-streaming only): the flat `caliban/auto` price (discounted on a cache hit) or the model's cost; for a node answer, the run's `cost_usd`. */
+                        "x-caliban-billed-usd"?: string;
                         /** @description The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes). */
                         "x-caliban-route"?: string;
                         /** @description Why `caliban/auto` answered with a model rather than a node. */
@@ -131,7 +133,15 @@ export interface paths {
                         /** @description Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters. */
                         "x-caliban-cache-tier"?: "exact" | "semantic";
                         "x-caliban-pii-entities"?: number;
+                        /** @description Cost of this request in USD (non-streaming only; absent when the model has no price). */
                         "x-caliban-cost-usd"?: string;
+                        /** @description What the request is billed in USD (non-streaming only): the flat `caliban/auto` price (discounted on a cache hit) or the model's cost; for a node answer, the run's `cost_usd`. */
+                        "x-caliban-billed-usd"?: string;
+                        /** @description The path taken: `node/<name>@v<N>` (a node answered), or `model:<id>` (a `caliban/auto` answer by a model, for a tenant that maps intents to nodes). */
+                        "x-caliban-route"?: string;
+                        /** @description The node run that answered. */
+                        "Caliban-Run-Id"?: string;
+                        "x-caliban-run-status"?: string;
                         [name: string]: unknown;
                     };
                     content: {
@@ -3183,6 +3193,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["Error"];
+                /** @description A job of this datasource is running (on any replica) */
                 409: components["responses"]["Error"];
                 422: components["responses"]["Error"];
             };
@@ -3202,7 +3213,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** The newest introspection job of the datasource (on the control plane that ran it) */
+        /**
+         * The newest introspection job of the datasource (stored; every control-plane replica answers)
+         * @description A job whose control plane stopped before it ended is shown `failed` once it is older than the job timeout (10 minutes) and a minute.
+         */
         get: {
             parameters: {
                 query?: never;
@@ -3245,7 +3259,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Propose ontology elements made outside Caliban (written as proposed, one version) */
+        /**
+         * Propose ontology elements made outside Caliban (written as proposed, one version)
+         * @description Elements are written as `proposed` in one version, whatever `status` they carry (it may be
+         *     left out). An element whose `spec`, `name` and `description` match the tenant's is skipped,
+         *     so posting the same model again makes no version and keeps every review decision. A
+         *     changed element goes back to `proposed`; over an approved element that withdraws it, which
+         *     is refused (`409`) when published node versions query it, unless `acknowledge_breaking`.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -3258,7 +3279,7 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
-                        elements: components["schemas"]["OntologyElement"][];
+                        elements: components["schemas"]["OntologyElementProposal"][];
                         /** @default false */
                         acknowledge_breaking?: boolean;
                     };
@@ -3272,13 +3293,22 @@ export interface paths {
                     };
                     content: {
                         "application/json": {
-                            tenant_id?: string;
-                            version?: number;
-                            proposed?: number;
-                            skipped?: number;
+                            tenant_id: string;
+                            /** @description The tenant's ontology version after the call (unchanged when nothing was written) */
+                            version: number;
+                            proposed: number;
+                            /** @description Elements left as they are: unchanged */
+                            skipped: number;
+                            /** @description Approved elements this call withdrew that published node versions query (empty unless acknowledge_breaking) */
+                            breaking: components["schemas"]["OntologyBreaking"][];
                         };
                     };
                 };
+                /** @description No elements, more than 5000, or an id that is empty, longer than 200 characters or repeated */
+                400: components["responses"]["Error"];
+                /** @description Unknown tenant */
+                404: components["responses"]["Error"];
+                /** @description Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them */
                 409: components["responses"]["Error"];
             };
         };
@@ -3295,11 +3325,14 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Current ontology (Caliban Semantic Model) for a tenant */
+        /**
+         * Current ontology (Caliban Semantic Model) for a tenant
+         * @description Element ids are per tenant, so `tenant_id` is required (`400` without it). Same as `GET /api/v1/tenants/{tenantId}/ontology`.
+         */
         get: {
             parameters: {
-                query?: {
-                    tenant_id?: components["parameters"]["TenantQuery"];
+                query: {
+                    tenant_id: string;
                 };
                 header?: never;
                 path?: never;
@@ -3316,6 +3349,8 @@ export interface paths {
                         "application/json": components["schemas"]["Ontology"];
                     };
                 };
+                400: components["responses"]["Error"];
+                404: components["responses"]["Error"];
             };
         };
         put?: never;
@@ -3375,6 +3410,7 @@ export interface paths {
                 };
                 400: components["responses"]["Error"];
                 404: components["responses"]["Error"];
+                /** @description Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them */
                 409: components["responses"]["Error"];
             };
         };
@@ -3440,6 +3476,7 @@ export interface paths {
             header?: never;
             path: {
                 tenantId: components["parameters"]["TenantId"];
+                /** @description `pinned` is reserved (the intent reported for a named model) and refused with `400`. */
                 intent: string;
             };
             cookie?: never;
@@ -3458,6 +3495,7 @@ export interface paths {
                 header?: never;
                 path: {
                     tenantId: components["parameters"]["TenantId"];
+                    /** @description `pinned` is reserved (the intent reported for a named model) and refused with `400`. */
                     intent: string;
                 };
                 cookie?: never;
@@ -3475,9 +3513,12 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["TenantIntentSet"];
+                    };
                 };
                 400: components["responses"]["Error"];
+                404: components["responses"]["Error"];
             };
         };
         post?: never;
@@ -3488,6 +3529,7 @@ export interface paths {
                 header?: never;
                 path: {
                     tenantId: components["parameters"]["TenantId"];
+                    /** @description `pinned` is reserved (the intent reported for a named model) and refused with `400`. */
                     intent: string;
                 };
                 cookie?: never;
@@ -3614,6 +3656,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["Error"];
+                /** @description Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them */
                 409: components["responses"]["Error"];
             };
         };
@@ -3668,6 +3711,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["Error"];
+                /** @description Withdraws approved elements published node versions query: `error.code` `ontology_breaking_change`, `error.breaking` lists them */
                 409: components["responses"]["Error"];
             };
         };
@@ -4401,10 +4445,7 @@ export interface paths {
                     };
                     content: {
                         "application/json": {
-                            documents: (components["schemas"]["RagDocument"] & {
-                                /** @description The version retrieval serves (null: none is ready) */
-                                live_version?: number | null;
-                            })[];
+                            documents: components["schemas"]["RagDocument"][];
                             next_cursor: string | null;
                         };
                     };
@@ -5529,10 +5570,12 @@ export interface components {
                 message: string;
                 /** @description e.g. invalid_request_error, authentication_error, permission_error, policy_violation, upstream_error, rate_limited */
                 type: string;
-                /** @description For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`). */
+                /** @description For rate_limited: the limit that was hit (e.g. tokens_per_minute). `validation_failed` when a node version cannot be created, published or promoted (see `problems`). `ontology_breaking_change` (`409`) when ontology decisions or proposals would withdraw approved elements that published node versions query (see `breaking`). */
                 code?: string | null;
                 /** @description Node version refusals (`422`, `validation_failed`): every reason, one by one, next to `message` (which joins them). */
                 problems?: components["schemas"]["Problem"][];
+                /** @description Ontology refusals (`409`, `ontology_breaking_change`): each approved element withdrawn and the published node versions that query it. Send `acknowledge_breaking: true` to go ahead. */
+                breaking?: components["schemas"]["OntologyBreaking"][];
             };
         };
         Problem: {
@@ -5721,8 +5764,14 @@ export interface components {
              * @enum {string}
              */
             semantic_cache?: "off" | "on";
+            /** @description Only for callers with `tenant.write` on the tenant (the dictionary may hold staff or customer names); others get `pii_patterns_count`. */
             pii_patterns?: components["schemas"]["PiiPattern"][];
+            /** @description Only for callers with `tenant.write` on the tenant; others get `pii_dictionary_count`. */
             pii_dictionary?: components["schemas"]["PiiTerm"][];
+            /** @description How many patterns the tenant has (every caller) */
+            pii_patterns_count?: number;
+            /** @description How many dictionary terms the tenant has (every caller) */
+            pii_dictionary_count?: number;
             /**
              * @description The tenant's PII mode also applies to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off by default: those models receive the text as is. External models always get the mode; a request's `caliban.pii_floor` (a node's `guardrails.pii`) applies to every model class.
              * @default false
@@ -5752,13 +5801,15 @@ export interface components {
             deleted_at?: string | null;
         };
         PiiPattern: {
-            /** @description NATIONAL_ID, PHONE, EMAIL, PERSON, ORG, LOCATION, IBAN or CARD use the built-in surrogates; other labels are custom (shape-preserving surrogates). */
+            /** @description Case-insensitive (stored as sent, used upper-cased: `phone` is `PHONE`). NATIONAL_ID, PHONE, EMAIL, PERSON, ORG, LOCATION, IBAN or CARD (and the aliases ID, NATIONALID, NAME, ORGANIZATION, ADDRESS) use the built-in surrogates; other labels are custom (shape-preserving surrogates; masked as `[LABEL]` upper-cased). */
             label: string;
             /** @description A regex in the Rust regex crate's syntax (linear time: no backreferences or lookaround); must not match the empty string. */
             pattern: string;
         };
         PiiTerm: {
+            /** @description Matched as a whole word, case-insensitively */
             term: string;
+            /** @description Case-insensitive, as for `PiiPattern.label` */
             label: string;
         };
         TenantCreate: {
@@ -5999,8 +6050,11 @@ export interface components {
             tenant_id: string;
             kind: components["schemas"]["DatasourceKind"];
             name: string;
-            /** @enum {string} */
-            status: "pending" | "connected" | "error" | "introspecting";
+            /**
+             * @description `pending` when created; `introspecting` while an introspection job runs, then `ready` or `failed` (see the job's `error`). `connected` and `error` are reserved: this release does not set them.
+             * @enum {string}
+             */
+            status: "pending" | "introspecting" | "ready" | "failed" | "connected" | "error";
             /** @description Monotonic data version used for cache invalidation */
             epoch?: number;
             /** @description Redacted connection settings: credentials are shown masked (`****`, or a URI as `scheme://user:****@host`); `{env}`/`{file}` references are shown as they are. Credentials are never returned. */
@@ -6019,14 +6073,19 @@ export interface components {
         };
         /** @enum {string} */
         OntologyElementKind: "entity" | "attribute" | "relation" | "metric" | "dimension" | "glossary_term" | "policy" | "verified_query";
-        OntologyElement: {
+        OntologyElement: components["schemas"]["OntologyElementProposal"] & {
+            /** @description The ontology version its spec or status last changed in. A CQIR query written for an older version keeps compiling while nothing it touches changed after that version. */
+            changed_in?: number;
+        };
+        /** @description An element as proposed through `POST /api/v1/tenants/{tenantId}/ontology/proposals`: `status` is optional there and ignored (the server writes `proposed`). Stored elements (`OntologyElement`) always have it. */
+        OntologyElementProposal: {
             id: string;
             kind: components["schemas"]["OntologyElementKind"];
             name: string;
             description?: string | null;
             synonyms?: string[];
             /** @enum {string} */
-            status: "proposed" | "approved" | "rejected" | "stale" | "deprecated";
+            status?: "proposed" | "approved" | "rejected" | "stale" | "deprecated";
             /** @enum {string} */
             provenance: "introspect" | "profile" | "query_log" | "llm" | "human";
             confidence?: number | null;
@@ -6034,25 +6093,43 @@ export interface components {
             spec?: {
                 [key: string]: unknown;
             };
-            /** @description The ontology version its spec or status last changed in. A CQIR query written for an older version keeps compiling while nothing it touches changed after that version. */
-            changed_in?: number;
+        };
+        OntologyBreaking: {
+            element: string;
+            /** @description For example `approved -> proposed` */
+            change: string;
+            /** @description `name@vN` of the published node versions whose fixed queries touch it */
+            nodes: string[];
+            /** @description The same node versions, structured */
+            versions: {
+                node: string;
+                version: number;
+            }[];
+        };
+        TenantIntentSet: {
+            tenant_id: string;
+            intent: string;
+            /** @description As stored: trimmed, duplicates dropped */
+            exemplars: string[];
+            /** @enum {string} */
+            source: "api";
         };
         IntrospectionJob: {
-            id?: string;
-            datasource_id?: string;
-            tenant_id?: string;
+            id: string;
+            datasource_id: string;
+            tenant_id: string;
             /** @enum {string} */
-            status?: "running" | "succeeded" | "failed";
+            status: "running" | "succeeded" | "failed";
             /** @description Collections the snapshot found */
-            objects?: number;
-            proposed?: number;
+            objects: number;
+            proposed: number;
             /** @description Proposals for elements already reviewed, or unchanged */
-            skipped?: number;
+            skipped: number;
             /** @description The ontology version the proposals were written in */
-            version?: number | null;
+            version: number | null;
             error?: string;
             /** Format: date-time */
-            started_at?: string;
+            started_at: string;
             /** Format: date-time */
             finished_at?: string;
         };
@@ -6399,19 +6476,7 @@ export interface components {
             cost_usd?: number;
             /** @description The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`. */
             model_cost_usd?: number;
-            /** @description The answer guard (docs/nodes.md): present when the final output carried untrusted labels. */
-            answer_check?: {
-                labels?: string[];
-                findings?: {
-                    /** @enum {string} */
-                    rule?: "untrusted_link" | "untrusted_contact" | "untrusted_reference" | "instruction_echo";
-                    label?: string;
-                    /** @description JSON pointer into the output */
-                    at?: string;
-                }[];
-                /** @enum {string} */
-                action?: "passed" | "redacted" | "refused";
-            };
+            answer_check?: components["schemas"]["AnswerCheck"];
             usage?: components["schemas"]["RunUsage"];
             steps: components["schemas"]["RunStep"][];
             /** @description How many times a worker claimed the run (more than 1 after a takeover or a resume) */
@@ -6530,6 +6595,19 @@ export interface components {
             /** @description On the last event of a stream */
             run?: components["schemas"]["NodeRun"];
         };
+        /** @description The answer guard (docs/nodes.md): present when the final output carried untrusted labels. */
+        AnswerCheck: {
+            labels?: string[];
+            findings?: {
+                /** @enum {string} */
+                rule?: "untrusted_link" | "untrusted_contact" | "untrusted_reference" | "instruction_echo";
+                label?: string;
+                /** @description JSON pointer into the output */
+                at?: string;
+            }[];
+            /** @enum {string} */
+            action?: "passed" | "redacted" | "refused";
+        };
         ConsoleRun: {
             id: string;
             /** @enum {string} */
@@ -6557,7 +6635,12 @@ export interface components {
             budget: {
                 [key: string]: unknown;
             };
+            /** @description What the run is billed (the flat auto price for a run `caliban/auto` started) */
             cost_usd?: number;
+            /** @description The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`. */
+            model_cost_usd?: number;
+            /** @description With `runs.read` (metadata only: labels, rules, pointers, the action; never text). Absent when the output carried no untrusted labels or the data key cannot be opened. */
+            answer_check?: components["schemas"]["AnswerCheck"];
             usage?: components["schemas"]["RunUsage"];
             claims?: number;
             last_event?: number;
@@ -6946,7 +7029,7 @@ export interface components {
              * @description Untrusted documents only: when its checks must have passed, or it fails. The collection's `vet_deadline_secs` from ingest, or from its release for a released version.
              */
             vet_deadline_at?: string;
-            /** @description In the document listing: the version being served */
+            /** @description In the document listing: the version retrieval serves (null: none is ready) */
             live_version?: number | null;
         };
         /** @enum {string} */
