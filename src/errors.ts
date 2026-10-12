@@ -83,6 +83,38 @@ export class CalibanAPIError extends CalibanError {
   }
 }
 
+/** `error.code` of a refused ontology withdrawal (409). */
+export const ONTOLOGY_BREAKING_CHANGE = 'ontology_breaking_change';
+
+/** One approved element a refused ontology call would withdraw (contract: `OntologyBreaking`). */
+export type OntologyBreakingChange = components['schemas']['OntologyBreaking'];
+
+/**
+ * An ontology review or proposal was refused (`409`, `code: 'ontology_breaking_change'`) because
+ * it withdraws approved elements that published node versions query. `breaking` lists each
+ * element, the `change` (`approved -> proposed`), and the node versions as `name@vN` (`nodes`) and
+ * structured (`versions`). Publish versions written on the new ontology, or repeat the call with
+ * `acknowledge_breaking: true`.
+ */
+export class CalibanOntologyBreakingError extends CalibanAPIError {
+  declare readonly code: typeof ONTOLOGY_BREAKING_CHANGE;
+  readonly breaking: OntologyBreakingChange[];
+  constructor(init: CalibanErrorInit & { status: number; breaking: OntologyBreakingChange[] }) {
+    super({ ...init, code: ONTOLOGY_BREAKING_CHANGE });
+    this.name = 'CalibanOntologyBreakingError';
+    this.breaking = init.breaking;
+  }
+}
+
+/** Works across duplicated copies of the SDK, like {@link isCalibanError}. */
+export function isOntologyBreakingError(value: unknown): value is CalibanOntologyBreakingError {
+  return (
+    isCalibanError(value) &&
+    value.code === ONTOLOGY_BREAKING_CHANGE &&
+    Array.isArray((value as { breaking?: unknown }).breaking)
+  );
+}
+
 /** Network failure before a response was received. */
 export class CalibanConnectionError extends CalibanError {
   constructor(init: Omit<CalibanErrorInit, 'type'> & { type?: CalibanErrorType }) {
@@ -145,7 +177,9 @@ export function defaultErrorType(status: number): CalibanErrorType {
   }
 }
 
-function isErrorBody(value: unknown): value is { error: { message?: unknown; type?: unknown; code?: unknown } } {
+function isErrorBody(
+  value: unknown,
+): value is { error: { message?: unknown; type?: unknown; code?: unknown; breaking?: unknown } } {
   return (
     typeof value === 'object' &&
     value !== null &&
@@ -163,15 +197,19 @@ export function errorFromBody(status: number, body: unknown, headers?: Headers, 
   let message: string | undefined;
   let type: CalibanErrorType | undefined;
   let code: string | null = null;
+  let breaking: OntologyBreakingChange[] | undefined;
   if (isErrorBody(body)) {
     const e = body.error;
     if (typeof e.message === 'string') message = e.message;
     if (typeof e.type === 'string') type = e.type;
     if (typeof e.code === 'string') code = e.code;
+    if (code === ONTOLOGY_BREAKING_CHANGE) {
+      breaking = Array.isArray(e.breaking) ? (e.breaking as OntologyBreakingChange[]) : [];
+    }
   } else if (typeof body === 'string' && body.trim() !== '') {
     message = truncate(body.trim());
   }
-  return new CalibanAPIError({
+  const init = {
     status,
     type: type ?? defaultErrorType(status),
     code,
@@ -179,7 +217,8 @@ export function errorFromBody(status: number, body: unknown, headers?: Headers, 
     requestId: headers?.get('x-caliban-request-id') ?? null,
     ...(headers ? { headers } : {}),
     body,
-  });
+  };
+  return breaking === undefined ? new CalibanAPIError(init) : new CalibanOntologyBreakingError({ ...init, breaking });
 }
 
 /** Read a non-2xx `Response` and map it to a {@link CalibanAPIError}. Consumes the body. */

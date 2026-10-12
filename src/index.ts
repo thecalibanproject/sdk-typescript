@@ -23,11 +23,14 @@ export {
   CalibanTimeoutError,
   CalibanAbortError,
   CalibanStreamError,
+  CalibanOntologyBreakingError,
+  ONTOLOGY_BREAKING_CHANGE,
   isCalibanError,
+  isOntologyBreakingError,
   errorFromBody,
   errorFromResponse,
 } from './errors.js';
-export type { CalibanErrorType, CalibanErrorInit, ErrorBody, ErrorObject } from './errors.js';
+export type { CalibanErrorType, CalibanErrorInit, ErrorBody, ErrorObject, OntologyBreakingChange } from './errors.js';
 export {
   DEFAULT_RETRY_POLICY,
   NON_IDEMPOTENT_RETRY_STATUSES,

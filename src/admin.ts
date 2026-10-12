@@ -40,8 +40,29 @@ export type ModelDiscovery =
 export type DatasourceKind = Schemas['DatasourceKind'];
 export type Datasource = Schemas['Datasource'];
 export type DatasourceCreate = Schemas['DatasourceCreate'];
-export type Ontology = Schemas['Ontology'];
-export type OntologyElement = Schemas['OntologyElement'];
+/**
+ * An element as proposed with `ontology.propose()` (contract: `OntologyElementProposal`):
+ * `status` may be left out, and whatever it says is ignored (the server writes `proposed`).
+ */
+export type OntologyElementProposal = Schemas['OntologyElementProposal'];
+/**
+ * A stored element (contract: `OntologyElement`): a proposal with a `status`, always present, and
+ * `changed_in`. The contract requires `status` in an `allOf` branch the generator does not carry
+ * over, so it is required here.
+ */
+export type OntologyElement = Schemas['OntologyElement'] & {
+  status: NonNullable<OntologyElementProposal['status']>;
+};
+/** A tenant's ontology (contract: `Ontology`), with every element's `status`. */
+export type Ontology = Omit<Schemas['Ontology'], 'elements'> & { elements: OntologyElement[] };
+/** `proposed`, `approved`, `rejected`, `stale` or `deprecated`. */
+export type OntologyElementStatus = OntologyElement['status'];
+/**
+ * An approved element that a decision or a proposal withdraws while published node versions query
+ * it (contract: `OntologyBreaking`): the `element`, the `change` (`approved -> proposed`), the
+ * versions as `name@vN` in `nodes`, and the same versions structured in `versions`.
+ */
+export type OntologyBreaking = Schemas['OntologyBreaking'];
 export type OntologyElementKind = Schemas['OntologyElementKind'];
 /** Body of `ontology.review()`: `tenant_id` is required (element ids are per tenant). */
 export type OntologyReview = NonNullable<
@@ -54,13 +75,20 @@ export type OntologyBatchReview = NonNullable<
   paths['/api/v1/tenants/{tenantId}/ontology/review']['post']['requestBody']
 >['content']['application/json'];
 /** Result of `ontology.reviewBatch()`: the new `version`, the reviewed `elements` and the `breaking` changes acknowledged. */
-export type OntologyBatchReviewResult =
-  paths['/api/v1/tenants/{tenantId}/ontology/review']['post']['responses'][200]['content']['application/json'];
+export type OntologyBatchReviewResult = Omit<
+  paths['/api/v1/tenants/{tenantId}/ontology/review']['post']['responses'][200]['content']['application/json'],
+  'elements' | 'breaking'
+> & { elements?: OntologyElement[]; breaking?: OntologyBreaking[] };
 /** Body of `ontology.propose()`: elements made outside Caliban, written as `proposed` (1 to 5000). */
 export type OntologyProposals = NonNullable<
   paths['/api/v1/tenants/{tenantId}/ontology/proposals']['post']['requestBody']
 >['content']['application/json'];
-/** Result of `ontology.propose()`: the ontology `version` and how many were `proposed` and `skipped` (unchanged). */
+/**
+ * Result of `ontology.propose()`: the ontology `version` after the call (unchanged when nothing was
+ * written), how many were `proposed` and `skipped` (unchanged in spec, name and description,
+ * whatever status they were sent with), and `breaking`: the approved elements the call withdrew
+ * that published node versions query (always present; empty unless `acknowledge_breaking`).
+ */
 export type OntologyProposalResult =
   paths['/api/v1/tenants/{tenantId}/ontology/proposals']['post']['responses'][201]['content']['application/json'];
 /** An ontology bootstrap job of a datasource (contract: `IntrospectionJob`). */
@@ -474,28 +502,35 @@ export class CalibanAdmin {
      * are per tenant, and the server answers `400` without it.
      */
     get: (query: { tenant_id: string }, opts?: AdminRequestOptions): Promise<Ontology> =>
-      unwrap(this.raw.GET('/api/v1/ontology', { ...opts, params: { query } })),
+      unwrap(this.raw.GET('/api/v1/ontology', { ...opts, params: { query } })) as Promise<Ontology>,
     /**
      * Approve, reject or deprecate one element of the tenant named in `body.tenant_id` (required:
      * element ids are per tenant). Withdrawing an approved element a published node version's fixed
-     * query touches is a 409 `CalibanAPIError` unless `acknowledge_breaking: true`.
+     * query touches throws a {@link CalibanOntologyBreakingError} (409, `ontology_breaking_change`)
+     * listing them, unless `acknowledge_breaking: true`.
      */
     review: (elementId: string, body: OntologyReview, opts?: AdminRequestOptions): Promise<OntologyElement> =>
       unwrap(
         this.raw.POST('/api/v1/ontology/elements/{elementId}/review', { ...opts, params: { path: { elementId } }, body }),
-      ),
+      ) as Promise<OntologyElement>,
     /**
      * Review many of the tenant's elements as one new ontology version (`ontology.review`). A
-     * breaking change (see `review()`) is a 409 unless `acknowledge_breaking: true`; the result
-     * lists the `breaking` changes acknowledged.
+     * breaking change (see `review()`) throws a {@link CalibanOntologyBreakingError} unless
+     * `acknowledge_breaking: true`; the result lists the `breaking` changes acknowledged.
      */
     reviewBatch: (tenantId: string, body: OntologyBatchReview, opts?: AdminRequestOptions): Promise<OntologyBatchReviewResult> =>
-      unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/ontology/review', { ...opts, params: { path: { tenantId } }, body })),
+      unwrap(
+        this.raw.POST('/api/v1/tenants/{tenantId}/ontology/review', { ...opts, params: { path: { tenantId } }, body }),
+      ) as Promise<OntologyBatchReviewResult>,
     /**
      * Propose elements made outside Caliban (an exported model, a curated file): written as
-     * `proposed` in one version for a human to review; unchanged elements are skipped. Proposing
-     * over an approved element withdraws it until it is approved again, a 409 when that breaks a
-     * published node version unless `acknowledge_breaking: true`.
+     * `proposed` in one version for a human to review (`status` may be left out; it is ignored).
+     * An element whose spec, name and description match the tenant's is skipped, so posting the
+     * same model again writes no version and keeps every review decision. A changed element goes
+     * back to `proposed`: over an approved element that withdraws it until it is approved again,
+     * and throws a {@link CalibanOntologyBreakingError} (409) when published node versions query
+     * it, unless `acknowledge_breaking: true`. A 400 for an empty batch, more than 5000 elements,
+     * or an empty, too long or repeated id.
      */
     propose: (tenantId: string, body: OntologyProposals, opts?: AdminRequestOptions): Promise<OntologyProposalResult> =>
       unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/ontology/proposals', { ...opts, params: { path: { tenantId } }, body })),

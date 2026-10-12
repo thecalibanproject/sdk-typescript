@@ -408,15 +408,23 @@ console.log(`${totals.auto_cache_hits ?? 0} auto cache hits saved customers $${(
 `datasources.introspect(datasourceId)` starts the ontology bootstrap and resolves to `{ job_id, job }`: the control plane connects with the datasource's credentials, checks that the principal is read only, samples every collection and writes its proposals (`status: 'proposed'`) in one ontology version. Elements a human already reviewed, and unchanged ones, are skipped. It is MongoDB only for now. `datasources.introspection(datasourceId)` returns the newest job (`running`, `succeeded` or `failed`, with `objects`, `proposed`, `skipped` and the ontology `version`); the control plane that ran it answers, and a datasource without a job throws a 404.
 
 ```ts
+import { isOntologyBreakingError } from '@caliban/sdk';
+
 const decisions = [{ id: 'Service', decision: 'approve' as const }];
-await admin.ontology.propose(tenant.id, { elements: curatedElements }); // made outside Caliban: { version, proposed, skipped }
+await admin.ontology.propose(tenant.id, { elements: curatedElements }); // made outside Caliban: { version, proposed, skipped, breaking }
 const res = await admin.ontology.reviewBatch(tenant.id, { decisions, note: 'reviewed' }); // one new version
-await admin.ontology.review('Customer', { tenant_id: tenant.id, decision: 'deprecate' });
+try {
+  await admin.ontology.review('Customer', { tenant_id: tenant.id, decision: 'deprecate' });
+} catch (err) {
+  if (!isOntologyBreakingError(err)) throw err;
+  for (const b of err.breaking) console.log(b.element, b.change, b.nodes); // 'Customer' 'approved -> deprecated' ['triage@v3']
+}
 ```
 
-- Element ids are per tenant (two tenants may both have `Service`), so `ontology.review()` requires `tenant_id` in the body; the server answers `400` without it. Decisions are `approve`, `reject` or `deprecate`.
-- Withdrawing an approved element that a published node version's fixed CQIR query touches is a breaking change: a `409` naming the elements and node versions, unless you send `acknowledge_breaking: true` (those versions then fail on that query until a version written on the new ontology is published). `reviewBatch()` returns the `breaking` changes it acknowledged. Proposing over an approved element withdraws it the same way.
-- Every element carries `changed_in`, the ontology version its spec or status last changed in.
+- Element ids are per tenant (two tenants may both have `Service`), so `ontology.get()` requires `tenant_id` in its query and `ontology.review()` in its body; the server answers `400` without it. Decisions are `approve`, `reject` or `deprecate`.
+- **Proposals** (`ontology.propose()`, `OntologyElementProposal`): `status` may be left out, and whatever it says is ignored, because every element is written as `proposed`. An element whose spec, name and description match the tenant's is skipped (`skipped`), whatever status it was sent with, so posting the same exported model again writes no version and keeps every review decision (synonyms, confidence and provenance are not compared). A changed element goes back to `proposed`. The result always carries `breaking` (empty unless you acknowledged some). `400` for an empty batch, more than 5000 elements, or an empty, too long or repeated id; `404` for an unknown tenant.
+- **Breaking changes.** Withdrawing an approved element that a published node version's fixed CQIR query touches (a decision, or a proposal that changes it) is refused with a `409` unless you send `acknowledge_breaking: true` (those versions then fail on that query until a version written on the new ontology is published). The SDK throws it as a `CalibanOntologyBreakingError` (a `CalibanAPIError` with `code: 'ontology_breaking_change'`), whose `breaking` lists each element, the `change` (`approved -> proposed`), the node versions as `name@vN` (`nodes`) and the same versions as `{ node, version }` (`versions`). `isOntologyBreakingError()` also works across two copies of the SDK. `reviewBatch()` and `propose()` return the `breaking` changes they acknowledged.
+- Stored elements (`OntologyElement`) always have a `status`, and carry `changed_in`, the ontology version their spec or status last changed in.
 
 #### Intents for `caliban/auto`
 
@@ -704,6 +712,7 @@ try {
 | Class | When |
 |---|---|
 | `CalibanAPIError` | Non-2xx response. Has `status`, `type` (for example `policy_violation`, `rate_limited`, `upstream_error`), `code`, `requestId`, `headers` and `body`. |
+| `CalibanOntologyBreakingError` | Subclass of `CalibanAPIError`: an ontology review or proposal was refused (`409`, `code: 'ontology_breaking_change'`). `breaking` lists the approved elements it would withdraw and the published node versions that query them. |
 | `CalibanConnectionError` | No response (DNS failure, connection reset, and so on). |
 | `CalibanTimeoutError` | Subclass of `CalibanConnectionError`: the attempt exceeded `timeoutMs`. |
 | `CalibanAbortError` | Your `AbortSignal` fired, or you called `stream.abort()`. |

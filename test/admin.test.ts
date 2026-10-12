@@ -3,7 +3,10 @@ import {
   CalibanAdmin,
   CalibanAPIError,
   CalibanConnectionError,
+  CalibanOntologyBreakingError,
   defineNode,
+  isOntologyBreakingError,
+  ONTOLOGY_BREAKING_CHANGE,
   type Eval,
   type EvalCheck,
   type EvalGate,
@@ -18,7 +21,10 @@ import {
   type GoldenVerdict,
   type InjectionReadOnly,
   type InjectionVerdict,
+  type OntologyBreaking,
   type OntologyElement,
+  type OntologyElementProposal,
+  type OntologyProposalResult,
   type PiiPattern,
   type PiiTerm,
   type Problem,
@@ -727,6 +733,68 @@ describe('CalibanAdmin: ontology bootstrap, intents and document collections', (
     const el = await a.ontology.review('Service', { tenant_id: 't_1', decision: 'deprecate', acknowledge_breaking: true });
     expect(el.status).toBe('deprecated');
     expect(JSON.parse(m.calls[0]!.body!)).toEqual({ tenant_id: 't_1', decision: 'deprecate', acknowledge_breaking: true });
+  });
+
+  it('proposes elements without a status; the result always lists breaking', async () => {
+    const m = mockFetch(json({ tenant_id: 't_1', version: 7, proposed: 0, skipped: 2, breaking: [] }, { status: 201 }));
+    const a = admin(m.fetch);
+    // An exported model sent again: status may be left out, and unchanged elements are skipped.
+    const proposal: OntologyElementProposal = { id: 'Service', kind: 'entity', name: 'Service', provenance: 'human' };
+    const res = await a.ontology.propose('t_1', { elements: [proposal, { ...proposal, id: 'Facility', status: 'approved' }] });
+    expect(JSON.parse(m.calls[0]!.body!).elements[0]).not.toHaveProperty('status');
+    expect([res.version, res.proposed, res.skipped, res.breaking]).toEqual([7, 0, 2, []]);
+    expectTypeOf<OntologyProposalResult['breaking']>().toEqualTypeOf<OntologyBreaking[]>();
+    expectTypeOf<OntologyElementProposal['status']>().toEqualTypeOf<OntologyElement['status'] | undefined>();
+    // A stored element always has its status.
+    expectTypeOf<OntologyElement['status']>().toEqualTypeOf<'proposed' | 'approved' | 'rejected' | 'stale' | 'deprecated'>();
+  });
+
+  it('throws a typed error listing the breaking changes of a refused withdrawal', async () => {
+    const breaking: OntologyBreaking[] = [
+      {
+        element: 'Service.city',
+        change: 'approved -> proposed',
+        nodes: ['triage@v3'],
+        versions: [{ node: 'triage', version: 3 }],
+      },
+    ];
+    const body = {
+      error: {
+        message: 'proposing changes to approved elements withdraws them, and published node versions query them',
+        type: 'conflict',
+        code: 'ontology_breaking_change',
+        breaking,
+      },
+    };
+    const m = mockFetch(json(body, { status: 409 }), json(body, { status: 409 }), json(body, { status: 409 }));
+    const a = admin(m.fetch);
+    const proposal: OntologyElementProposal = { id: 'Service.city', kind: 'attribute', name: 'city', provenance: 'human' };
+    const err = await a.ontology.propose('t_1', { elements: [proposal] }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CalibanOntologyBreakingError);
+    expect(err).toBeInstanceOf(CalibanAPIError);
+    expect(isOntologyBreakingError(err)).toBe(true);
+    if (!(err instanceof CalibanOntologyBreakingError)) throw new Error('unreachable');
+    expect([err.status, err.type, err.code]).toEqual([409, 'conflict', ONTOLOGY_BREAKING_CHANGE]);
+    expect(err.breaking).toEqual(breaking);
+    expect(err.breaking[0]!.versions[0]).toEqual({ node: 'triage', version: 3 });
+
+    // The single and the batch review refuse the same way.
+    const single = await a.ontology.review('Service.city', { tenant_id: 't_1', decision: 'reject' }).catch((e: unknown) => e);
+    const batch = await a.ontology
+      .reviewBatch('t_1', { decisions: [{ id: 'Service.city', decision: 'deprecate' }] })
+      .catch((e: unknown) => e);
+    expect([isOntologyBreakingError(single), isOntologyBreakingError(batch)]).toEqual([true, true]);
+    expect(m.calls).toHaveLength(3);
+  });
+
+  it('keeps other 409s plain', async () => {
+    const m = mockFetch(json({ error: { message: 'breaks invoice-triage@v3', type: 'conflict', code: null } }, { status: 409 }));
+    const err = await admin(m.fetch)
+      .ontology.reviewBatch('t_1', { decisions: [{ id: 'Service', decision: 'deprecate' }] })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CalibanAPIError);
+    expect(err).not.toBeInstanceOf(CalibanOntologyBreakingError);
+    expect(isOntologyBreakingError(err)).toBe(false);
   });
 
   it('lists, sets and drops the tenant intents', async () => {
