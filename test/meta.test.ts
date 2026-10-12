@@ -194,3 +194,25 @@ describe('parseResponseMeta on node answers', () => {
     expect(JSON.parse(JSON.stringify(res))).toEqual(completion);
   });
 });
+
+describe('/v1/messages responses', () => {
+  it('reads the billing, route and run headers of an Anthropic Messages response', () => {
+    const m = meta({
+      [HEADER_REQUEST_ID]: 'req_m1',
+      [HEADER_COST_USD]: '0.0021',
+      [HEADER_BILLED_USD]: '0.01',
+      [HEADER_ROUTE]: 'node/triage@v3',
+      [HEADER_RUN_ID]: 'run_m1',
+      [HEADER_RUN_STATUS]: 'succeeded',
+      'content-type': 'application/json',
+    });
+    expect([m.requestId, m.costUsd, m.billedUsd, m.route, m.runId, m.runStatus]).toEqual([
+      'req_m1',
+      0.0021,
+      0.01,
+      'node/triage@v3',
+      'run_m1',
+      'succeeded',
+    ]);
+  });
+});

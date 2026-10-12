@@ -120,13 +120,13 @@ The gateway reports what it did in `x-caliban-*` response headers. The SDK parse
 | `x-caliban-intent` | `intent` | The routing decision, parsed into `{ intent, confidence, stage, knnReason? }`. `undefined` when absent or malformed. |
 | `x-caliban-pii-entities` | `piiEntities` | Number of PII entities detected and protected. |
 | `x-caliban-cost-usd` | `costUsd` | Non-streaming responses only; `null` when the model has no price. For a node answer, the routed models' real cost (the run's `model_cost_usd`). |
-| `x-caliban-billed-usd` | `billedUsd` | Non-streaming node answers: what the run is billed (its `cost_usd`). `undefined` otherwise. |
+| `x-caliban-billed-usd` | `billedUsd` | Non-streaming only: what the request is billed, the flat `caliban/auto` price (discounted on a cache hit) or the model's cost; for a node answer, the run's `cost_usd`. `undefined` when absent. |
 | `x-caliban-route` | `route` | `node/<name>@v<N>` when a node answered, `model:<id>` when `caliban/auto` answered with a model for a tenant that maps intents to nodes. |
 | `x-caliban-route-fallback` | `routeFallback` | Why `caliban/auto` answered with a model rather than a node (`low_confidence`, `no_node_for_intent`, ...). |
 | `Caliban-Run-Id` | `runId` | The node run that answered. |
 | `x-caliban-run-status` | `runStatus` | Its status, for example `succeeded` or `input_required`. |
 
-`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_CACHE_TIER`, `HEADER_INTENT`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`, `HEADER_BILLED_USD`, `HEADER_ROUTE`, `HEADER_ROUTE_FALLBACK`, `HEADER_RUN_ID`, `HEADER_RUN_STATUS`), and `parseResponseMeta(response)` works on any `Response`. The last five are only set when the gateway sends them.
+`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_CACHE_TIER`, `HEADER_INTENT`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`, `HEADER_BILLED_USD`, `HEADER_ROUTE`, `HEADER_ROUTE_FALLBACK`, `HEADER_RUN_ID`, `HEADER_RUN_STATUS`), and `parseResponseMeta(response)` works on any `Response`, including one from `POST /v1/messages` (the Anthropic Messages API), where the gateway sends the same headers: billed cost, route, run id and run status included. The last five are only set when the gateway sends them.
 
 A node answer (`model: 'node/<name>'`, or `caliban/auto` handing the request to a node) carries the headers of every chat response: `requestId`, `routedModel` (`node/<name>@v<N>`), `cache: 'bypass'`, and on non-streaming answers `piiEntities` (the entities protected across the run's model calls), `costUsd` and `billedUsd`.
 
@@ -619,7 +619,11 @@ await new CalibanAdmin().nodes.create({ tenant_id: 't_1', name: 'invoice-triage'
 
 **Reasoning and constrained decoding.** `model_policy.reasoning` (`off`, `low`, `medium`, `high`) is the default reasoning effort of the node's model calls, and a model vertex's `config.reasoning` (`llm`, `router`, `verify`, `reduce` with mode `llm`) overrides it; the gateway maps it per model family, as for `caliban.reasoning`. `config.structured_output` is `json_schema` (the default: the vertex's `output_schema`, or a router's labels, go as `response_format` so vLLM, SGLang and OpenAI constrain decoding) or `prompt` (the schema in the prompt only, for servers without guided decoding). The answer is validated either way.
 
-**Guardrails.** `guardrails.answer` is the answer guard on the run's final output when it carries untrusted labels: `redact` (the default) removes links, contacts and references that only untrusted free text supplied, and echoes of injected instructions; `refuse` fails the run instead; `off` skips the check. `guardrails.pii` is a floor on the personal-data protection of the node's model calls on every model class, sovereign models included, and of untrusted tool arguments and results; it only strengthens the tenant's mode.
+**Guardrails.** `guardrails.answer` is the answer guard on the run's final output when it carries untrusted labels: `redact` (the default) removes links, contacts and references that only untrusted free text supplied, and echoes of injected instructions; `refuse` fails the run instead; `off` skips the check. `guardrails.pii` is a floor on the personal-data protection of the node's model calls on every model class, sovereign models included, and of untrusted tool arguments; it only strengthens the tenant's mode (`off` < `reversible` < `mask`). How tool results enter the run depends on the resulting mode:
+
+- `reversible`: tool results enter the run as they are. The gateway pseudonymises every model call and restores its reply, untrusted tools get surrogates in their arguments, and the answer is restored for the caller, so a phone number from a catalogue row that the answer quotes reaches the caller as the real number. (Pseudonymising results as they entered the run would hand the caller surrogates nothing could restore.) Pseudonymised data is still personal data ([research note 05](https://github.com/thecalibanproject/docs/blob/main/research/05-anonymization-and-privacy.md)).
+- `mask`: tool results are masked as they enter, irreversibly: the model, every later step and the caller see `[PHONE]`.
+- `off`: as they are.
 
 ```ts
 const triage = defineNode({

@@ -179,6 +179,15 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<ChatHeaders['x-caliban-intent']>().toEqualTypeOf<string | undefined>();
     expectTypeOf<MessagesHeaders['x-caliban-intent']>().toEqualTypeOf<string | undefined>();
     expectTypeOf<NonNullable<ChatHeaders['x-caliban-cache']>>().toEqualTypeOf<'hit' | 'miss' | 'bypass'>();
+    // /v1/messages declares the billing, route and run headers the meta parser reads, like chat.
+    type MetaHeaders = 'x-caliban-billed-usd' | 'x-caliban-route' | 'Caliban-Run-Id' | 'x-caliban-run-status';
+    expectTypeOf<Pick<MessagesHeaders, MetaHeaders>>().toEqualTypeOf<{
+      'x-caliban-billed-usd'?: string;
+      'x-caliban-route'?: string;
+      'Caliban-Run-Id'?: string;
+      'x-caliban-run-status'?: string;
+    }>();
+    expectTypeOf<Pick<ChatHeaders, MetaHeaders>>().toEqualTypeOf<Pick<MessagesHeaders, MetaHeaders>>();
     expectTypeOf<RouteStage>().toEqualTypeOf<NonNullable<UsageEvent['route_stage']>>();
     expectTypeOf<IntentDecision['stage']>().toEqualTypeOf<RouteStage>();
 
