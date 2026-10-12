@@ -28,6 +28,7 @@ import {
   type PiiPattern,
   type PiiTerm,
   type Problem,
+  type Tenant,
   type UsageByPurpose,
   type UsagePurpose,
 } from '../src/index.js';
@@ -278,6 +279,28 @@ describe('CalibanAdmin', () => {
     // @ts-expect-error a pattern is closed: `flags` is not a field
     const bad: PiiPattern = { label: 'X', pattern: 'x', flags: 'i' };
     expect(bad).toBeDefined();
+  });
+
+  it('reads the PII detectors only with tenant.write, and the counts always', async () => {
+    // A caller without tenant.write gets the counts, never the patterns or the dictionary.
+    const reader = { ...tenant, pii_patterns_count: 2, pii_dictionary_count: 40 };
+    const writer = { ...reader, pii_patterns: [{ label: 'phone', pattern: '\\+961[0-9]{8}' }], pii_dictionary: [] };
+    const m = mockFetch(json([reader]), json(writer));
+    const a = admin(m.fetch);
+    const [t] = await a.tenants.list();
+    expect([t!.pii_patterns, t!.pii_dictionary, t!.pii_patterns_count, t!.pii_dictionary_count]).toEqual([
+      undefined,
+      undefined,
+      2,
+      40,
+    ]);
+    const w = await a.tenants.get('t_1');
+    // Labels are case-insensitive: stored as sent, used upper-cased (`phone` is `PHONE`).
+    expect(w.pii_patterns?.[0]?.label).toBe('phone');
+    expectTypeOf<Tenant['pii_patterns']>().toEqualTypeOf<PiiPattern[] | undefined>();
+    expectTypeOf<Tenant['pii_dictionary']>().toEqualTypeOf<PiiTerm[] | undefined>();
+    expectTypeOf<Tenant['pii_patterns_count']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<Tenant['pii_dictionary_count']>().toEqualTypeOf<number | undefined>();
   });
 
   it('reports usage per purpose', async () => {

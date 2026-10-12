@@ -7,6 +7,11 @@ import type { NodeSpec } from './node.js';
 import { resolveRetryPolicy, type RetryOptions } from './retry.js';
 
 type Schemas = components['schemas'];
+/**
+ * A tenant (contract: `Tenant`). `pii_patterns` and `pii_dictionary` (which may hold staff or
+ * customer names) are present only for callers with `tenant.write` on the tenant; every caller of
+ * `tenants.get()` and `tenants.list()` gets `pii_patterns_count` and `pii_dictionary_count`.
+ */
 export type Tenant = Schemas['Tenant'];
 export type TenantCreate = Schemas['TenantCreate'];
 /** Body for `tenants.update()` (contract: `TenantUpdate`). Absent fields keep their value. */
@@ -15,9 +20,12 @@ export type TenantUpdate = Schemas['TenantUpdate'];
 export type PiiSurrogateScope = NonNullable<Tenant['pii_surrogate_scope']>;
 /** `semantic_cache` tenant setting: `off` (default) or `on`. */
 export type SemanticCacheSetting = NonNullable<Tenant['semantic_cache']>;
-/** One of the tenant's own L0 PII patterns (contract: `PiiPattern`): a `label` and a linear-time Rust `regex`. */
+/**
+ * One of the tenant's own L0 PII patterns (contract: `PiiPattern`): a `label` and a linear-time
+ * Rust `regex`. Labels are case-insensitive: stored as sent, used upper-cased (`phone` is `PHONE`).
+ */
 export type PiiPattern = Schemas['PiiPattern'];
-/** One term of the tenant's PII dictionary (contract: `PiiTerm`): whole-word, case-insensitive. */
+/** One term of the tenant's PII dictionary (contract: `PiiTerm`): whole-word, case-insensitive, and so is its `label`. */
 export type PiiTerm = Schemas['PiiTerm'];
 export type ApiKeyInfo = Schemas['ApiKeyInfo'];
 export type ApiKeyCreated = Schemas['ApiKeyCreated'];
@@ -340,7 +348,7 @@ export class CalibanAdmin {
       unwrap(this.raw.GET('/api/v1/tenants', { ...opts, params: { query: { include_deleted } } })),
     create: (body: TenantCreate, opts?: AdminRequestOptions): Promise<Tenant> =>
       unwrap(this.raw.POST('/api/v1/tenants', { ...opts, body })),
-    /** A deleted tenant is a 404. */
+    /** A deleted tenant is a 404. The PII detectors only with `tenant.write`; their counts always. */
     get: (tenantId: string, opts?: AdminRequestOptions): Promise<Tenant> =>
       unwrap(this.raw.GET('/api/v1/tenants/{tenantId}', { ...opts, params: { path: { tenantId } } })),
     /**
