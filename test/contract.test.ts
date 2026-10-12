@@ -141,6 +141,9 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<KnownKeys<TenantUpdate>>().toEqualTypeOf<
       | 'pii_default'
       | 'pii_surrogate_scope'
+      | 'pii_on_sovereign'
+      | 'pii_patterns'
+      | 'pii_dictionary'
       | 'semantic_cache'
       | 'auto_cache_hit_fraction'
       | 'node_caps'

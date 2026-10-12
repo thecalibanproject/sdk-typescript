@@ -81,10 +81,10 @@ describe('CalibanAdmin', () => {
       json({ job_id: 'job_1' }, { status: 202 }),
     );
     const a = admin(m.fetch);
-    const el = await a.ontology.review('e1', { decision: 'approve', note: 'lgtm' });
+    const el = await a.ontology.review('e1', { tenant_id: 't_1', decision: 'approve', note: 'lgtm' });
     expect(el.status).toBe('approved');
     expect(m.calls[0]).toMatchObject({ method: 'POST', url: 'http://cp:8081/api/v1/ontology/elements/e1/review' });
-    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ decision: 'approve', note: 'lgtm' });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ tenant_id: 't_1', decision: 'approve', note: 'lgtm' });
     expect(await a.datasources.introspect('ds1')).toEqual({ job_id: 'job_1' });
   });
 

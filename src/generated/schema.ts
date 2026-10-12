@@ -1113,8 +1113,9 @@ export interface paths {
                         nodes?: string[];
                         /**
                          * @description Datasource scopes (`<datasource>.<object>:read`) the built-in datasource query tool
-                         *     may read for this key's runs, intersected with each node's `datasources.scopes`.
-                         *     Absent: every scope of the nodes it runs.
+                         *     may read for this key's runs, and document collections (`rag.<collection>:read`) the
+                         *     built-in `rag_search` tool may search, intersected with each node's
+                         *     `datasources.scopes`. Absent: every scope of the nodes it runs.
                          */
                         datasource_scopes?: string[];
                     };
@@ -2401,6 +2402,8 @@ export interface paths {
                             node?: string;
                             version?: number;
                             has_write_tools?: boolean;
+                            /** @description Read tools that bring data in (MCP, datasource_query, rag_search): the version is gated on an injection eval unless the policy makes it optional */
+                            has_untrusted_reads?: boolean;
                             allowed?: boolean;
                             /** @description The evals that meet the bar; null when no gate applies */
                             evidence?: components["schemas"]["GateEvidence"] | null;
@@ -3150,7 +3153,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Introspect and profile a source, then propose ontology elements (all with status=proposed) */
+        /**
+         * Introspect and profile a source, then propose ontology elements (all with status=proposed)
+         * @description The ontology bootstrap (docs/datasources.md): connects with the datasource's credentials, checks the
+         *     principal is read only, samples every collection, and writes proposals in one ontology version.
+         *     Proposals for elements a human already reviewed, and unchanged ones, are skipped. MongoDB only.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -3170,9 +3178,108 @@ export interface paths {
                     content: {
                         "application/json": {
                             job_id?: string;
+                            job?: components["schemas"]["IntrospectionJob"];
                         };
                     };
                 };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/datasources/{datasourceId}/introspection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                datasourceId: string;
+            };
+            cookie?: never;
+        };
+        /** The newest introspection job of the datasource (on the control plane that ran it) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    datasourceId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IntrospectionJob"];
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/ontology/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Propose ontology elements made outside Caliban (written as proposed, one version) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        elements: components["schemas"]["OntologyElement"][];
+                        /** @default false */
+                        acknowledge_breaking?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description Written (unchanged elements skipped) */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tenant_id?: string;
+                            version?: number;
+                            proposed?: number;
+                            skipped?: number;
+                        };
+                    };
+                };
+                409: components["responses"]["Error"];
             };
         };
         delete?: never;
@@ -3230,7 +3337,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Approve or reject a proposed ontology element */
+        /**
+         * Review one ontology element of the tenant named in the body
+         * @description Element ids are per tenant (two tenants may both have `Service`): `tenant_id` is required
+         *     (`400` without it). Same as `POST /api/v1/tenants/{tenantId}/ontology/elements/{elementId}/review`.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -3243,9 +3354,306 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
+                        tenant_id: string;
                         /** @enum {string} */
-                        decision: "approve" | "reject";
+                        decision: "approve" | "reject" | "deprecate";
                         note?: string;
+                        /** @default false */
+                        acknowledge_breaking?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description The element, with the ontology `version` and any `breaking` changes acknowledged */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["OntologyElement"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/intents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /** The tenant's caliban/auto intents and exemplars as routers use them (routes.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Each intent with its exemplars, `source` (`config`: the file; `api`: set here) and the node it hands to; `removed`: file intents an empty list removes */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tenant_id?: string;
+                            intents?: {
+                                intent?: string;
+                                exemplars?: string[];
+                                /** @enum {string} */
+                                source?: "config" | "api";
+                                node?: string | null;
+                            }[];
+                            removed?: string[];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/intents/{intent}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                intent: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set the tenant's exemplars of an intent, over the config file's (routes.write)
+         * @description At most 100 intents per tenant and 200 exemplars per intent (each 1 to 2000 characters;
+         *     duplicates dropped). An empty list removes a config-file intent for this tenant. Shipped in
+         *     the snapshot: routers rebuild their kNN index without a restart. Audited as
+         *     `tenant.intent.set` with counts, never the texts.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    intent: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        exemplars: string[];
+                    };
+                };
+            };
+            responses: {
+                /** @description The intent as stored */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["Error"];
+            };
+        };
+        post?: never;
+        /** Drop the tenant's own exemplars of an intent (the config file's apply again) */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    intent: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Removed (audited as `tenant.intent.delete`) */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/ontology": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /** The tenant's current ontology (ontology.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Ontology"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/ontology/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Review a batch of the tenant's ontology elements as one version (ontology.review)
+         * @description Every decision applies to the tenant's element of that id. The batch is one new ontology
+         *     version (none when it changes nothing). A decision that withdraws an approved element that
+         *     a published node version's fixed CQIR query touches is a breaking change: `409` naming the
+         *     elements and node versions, unless `acknowledge_breaking: true` (those versions then fail on
+         *     that query until a version written on the new ontology is published). Approving new
+         *     elements, or changing elements no fixed query touches, is compatible: published versions
+         *     keep working on the new version. Audited as `ontology.review`.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        decisions: {
+                            id: string;
+                            /** @enum {string} */
+                            decision: "approve" | "reject" | "deprecate";
+                        }[];
+                        note?: string;
+                        /** @default false */
+                        acknowledge_breaking?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description The new version, the reviewed elements, and the breaking changes acknowledged */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tenant_id?: string;
+                            version?: number;
+                            elements?: components["schemas"]["OntologyElement"][];
+                            breaking?: {
+                                element?: string;
+                                change?: string;
+                                /** @description name@vN */
+                                nodes?: string[];
+                            }[];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/ontology/elements/{elementId}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                elementId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Review one of the tenant's ontology elements (a batch of one) */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    elementId: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        decision: "approve" | "reject" | "deprecate";
+                        note?: string;
+                        /** @default false */
+                        acknowledge_breaking?: boolean;
                     };
                 };
             };
@@ -3259,6 +3667,8 @@ export interface paths {
                         "application/json": components["schemas"]["OntologyElement"];
                     };
                 };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
             };
         };
         delete?: never;
@@ -3746,6 +4156,454 @@ export interface paths {
                     content?: never;
                 };
                 404: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/rag/collections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /** The tenant's document collections (rag.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RagCollection"][];
+                    };
+                };
+                503: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        /**
+         * Create a document collection (rag.write)
+         * @description A collection is what nodes search with `builtin://rag_search`, named in their scopes as
+         *     `rag.<name>:read`. `embedding_model` must be a catalogue embedding model the tenant can reach (its own
+         *     provider or a shared one); it is fixed for the collection's life. `rerank_model` (a catalogue rerank
+         *     model) is optional. Its vectors live in a Qdrant collection of their own. Audited
+         *     (`rag.collection.create`). `503` when the control plane has no document registry
+         *     (`CALIBAN_DATABASE_URL`, or a standalone process with a KEK).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RagCollectionCreate"];
+                };
+            };
+            responses: {
+                /** @description Created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RagCollection"];
+                    };
+                };
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/rag/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The embedding and rerank models the tenant can reach, for a collection (rag.read)
+         * @description Catalogue models of kind `embedding` and `rerank` served by one of the tenant's providers or a shared provider that serves it.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            embedding: components["schemas"]["RagModel"][];
+                            rerank: components["schemas"]["RagModel"][];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/rag/collections/{collection}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                collection: string;
+            };
+            cookie?: never;
+        };
+        /** A collection, with the published node versions that search it (rag.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RagCollection"] & {
+                            /** @description Published versions (`name@vN`) whose scopes name it */
+                            used_by: string[];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        /**
+         * Delete a collection and its documents (rag.write)
+         * @description Its documents stop being served at once; workers then drop its vectors. `409` while a published node
+         *     version names it in its scopes (`rag.*:read` does not hold it). Audited (`rag.collection.delete`).
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                collection: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Documents of a collection, by id (rag.read)
+         * @description The newest version of each document (deleted documents left out), with the version being served. Never the content.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Only documents whose newest version is in this state */
+                    status?: components["schemas"]["RagDocumentStatus"];
+                    /** @description next_cursor of the previous page */
+                    cursor?: string;
+                    limit?: number;
+                };
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            documents: (components["schemas"]["RagDocument"] & {
+                                /** @description The version retrieval serves (null: none is ready) */
+                                live_version?: number | null;
+                            })[];
+                            next_cursor: string | null;
+                        };
+                    };
+                };
+                400: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        /**
+         * Ingest a document (rag.write)
+         * @description Adds a version of `doc_id` (`version` = the previous one + 1). The content (with its title) is sealed under
+         *     the tenant's data key at once and never returned. The version is `pending` and **invisible** until a
+         *     worker has indexed it and its checks passed: chunking with heading paths, the injection scan, a
+         *     near-duplicate check for untrusted sources, personal data pseudonymised before embedding. Then it is
+         *     `ready` (and replaces the previous version in one step), or `quarantined` (invisible until released), or
+         *     `failed`. Markdown, HTML and plain text; PDF is refused (`422`): convert it first. At most 5 MB of text.
+         *     Ingesting the same content and settings as the newest version again changes nothing (`200`,
+         *     `unchanged: true`). Audited (`rag.document.ingest`).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RagDocumentIngest"];
+                };
+            };
+            responses: {
+                /** @description The same content was already there */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RagDocument"] & {
+                            /** @enum {boolean} */
+                            unchanged?: true;
+                        };
+                    };
+                };
+                /** @description A new pending version */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RagDocument"] & {
+                            /** @enum {boolean} */
+                            unchanged?: false;
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                collection: string;
+                docId: string;
+            };
+            cookie?: never;
+        };
+        /** Every version of a document, newest first (rag.read) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                    docId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            doc_id: string;
+                            live_version: number | null;
+                            versions: components["schemas"]["RagDocument"][];
+                        };
+                    };
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        put?: never;
+        post?: never;
+        /**
+         * Delete every version of a document (rag.write)
+         * @description It stops being served at once and its sealed content is wiped; workers then delete its vectors. Audited (`rag.document.delete`).
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                    docId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["Error"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                collection: string;
+                docId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release a quarantined version (rag.approve)
+         * @description A decision about the findings it was quarantined for: `acknowledge_findings` must be `true` (`422`
+         *     otherwise). The version goes back to `pending`, is indexed again with its findings acknowledged and served
+         *     once ready. `409` when the version is not quarantined. Audited (`rag.document.release`, with the findings).
+         *     Released text is still labelled `retrieved` in node runs: a tainted write it inspires needs an allowlist
+         *     entry or a human approval.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    collection: string;
+                    docId: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        version: number;
+                        acknowledge_findings: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description The version, pending again */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RagDocument"];
+                    };
+                };
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+                422: components["responses"]["Error"];
             };
         };
         delete?: never;
@@ -4538,9 +5396,11 @@ export interface paths {
         /**
          * Run decisions from the data plane
          * @description Authenticated with the router token. Workers deliver the decisions made on the data plane
-         *     (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`) at least once;
-         *     each event id is recorded once in the hash-chained audit log, so a retry appends nothing.
-         *     Other actions are `rejected`.
+         *     (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`,
+         *     `node.eval.finish`) at least once; each event id is recorded once in the hash-chained audit
+         *     log, so a retry appends nothing. Every other action, including the control plane's own
+         *     (`rag.*`, `node.golden_set.*`, `node.eval_policy.update`, `node.eval.start`,
+         *     `node.eval.cancel`), is counted as `rejected` and not recorded.
          */
         post: {
             parameters: {
@@ -4706,6 +5566,11 @@ export interface components {
              */
             pii?: "off" | "mask" | "reversible";
             /**
+             * @description A minimum protection applied to every model class, sovereign and attested models included (a node's `guardrails.pii` sets it on its calls). Only strengthens: the request gets the stricter of this and `pii` (or the tenant's mode), ordered off < reversible < mask.
+             * @enum {string}
+             */
+            pii_floor?: "off" | "mask" | "reversible";
+            /**
              * @description `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache when the tenant has it on, whatever the temperature (without it, the semantic cache applies only up to `[cache.semantic] max_temperature`). Unset: exact, plus semantic within the temperature limit when the tenant has it on.
              * @default exact
              * @enum {string}
@@ -4856,6 +5721,13 @@ export interface components {
              * @enum {string}
              */
             semantic_cache?: "off" | "on";
+            pii_patterns?: components["schemas"]["PiiPattern"][];
+            pii_dictionary?: components["schemas"]["PiiTerm"][];
+            /**
+             * @description The tenant's PII mode also applies to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off by default: those models receive the text as is. External models always get the mode; a request's `caliban.pii_floor` (a node's `guardrails.pii`) applies to every model class.
+             * @default false
+             */
+            pii_on_sovereign?: boolean;
             /**
              * @description Surrogate consistency for reversible PII. `tenant`: the same value always gets the same surrogate in this tenant (keyed HMAC per tenant, derived from CALIBAN_KEK), so pseudonymised requests can hit the exact cache; sessions of the tenant become linkable through their surrogates. `session`: fresh surrogates per request. Surrogates never cross tenants.
              * @default tenant
@@ -4879,6 +5751,16 @@ export interface components {
             /** Format: date-time */
             deleted_at?: string | null;
         };
+        PiiPattern: {
+            /** @description NATIONAL_ID, PHONE, EMAIL, PERSON, ORG, LOCATION, IBAN or CARD use the built-in surrogates; other labels are custom (shape-preserving surrogates). */
+            label: string;
+            /** @description A regex in the Rust regex crate's syntax (linear time: no backreferences or lookaround); must not match the empty string. */
+            pattern: string;
+        };
+        PiiTerm: {
+            term: string;
+            label: string;
+        };
         TenantCreate: {
             name: string;
             region?: string;
@@ -4892,6 +5774,12 @@ export interface components {
              * @enum {string}
              */
             pii_surrogate_scope?: "tenant" | "session";
+            /** @default false */
+            pii_on_sovereign?: boolean;
+            /** @description The tenant's own L0 PII patterns (replaced as a whole; [] clears them). */
+            pii_patterns?: components["schemas"]["PiiPattern"][];
+            /** @description The tenant's PII dictionary: whole-word, case-insensitive terms (replaced as a whole; [] clears it). Audited as a count of terms, never the terms. */
+            pii_dictionary?: components["schemas"]["PiiTerm"][];
             /**
              * @default off
              * @enum {string}
@@ -4908,6 +5796,12 @@ export interface components {
             pii_default?: "off" | "mask" | "reversible";
             /** @enum {string} */
             pii_surrogate_scope?: "tenant" | "session";
+            /** @description Apply the PII mode to sovereign and attested models too. */
+            pii_on_sovereign?: boolean;
+            /** @description The tenant's own L0 PII patterns (replaced as a whole; [] clears them). */
+            pii_patterns?: components["schemas"]["PiiPattern"][];
+            /** @description The tenant's PII dictionary: whole-word, case-insensitive terms (replaced as a whole; [] clears it). Audited as a count of terms, never the terms. */
+            pii_dictionary?: components["schemas"]["PiiTerm"][];
             /** @enum {string} */
             semantic_cache?: "off" | "on";
             /** @description A number sets the override; `null` clears it (the deployment value applies); absent keeps it. */
@@ -4959,7 +5853,7 @@ export interface components {
             revoked_at?: string | null;
             /** @description Node allowlist. `null`: every published node of the tenant; `[]`: none. */
             nodes?: string[] | null;
-            /** @description Datasource scopes the built-in query tool may read for this key (absent: every scope of the nodes it runs). */
+            /** @description Datasource scopes the built-in query tool may read, and document collections (rag.<collection>:read) rag_search may search, for this key (absent: every scope of the nodes it runs). */
             datasource_scopes?: string[];
             /**
              * @description `eval`: the tenant's eval key, managed by the control plane (absent on keys customers create)
@@ -5140,6 +6034,27 @@ export interface components {
             spec?: {
                 [key: string]: unknown;
             };
+            /** @description The ontology version its spec or status last changed in. A CQIR query written for an older version keeps compiling while nothing it touches changed after that version. */
+            changed_in?: number;
+        };
+        IntrospectionJob: {
+            id?: string;
+            datasource_id?: string;
+            tenant_id?: string;
+            /** @enum {string} */
+            status?: "running" | "succeeded" | "failed";
+            /** @description Collections the snapshot found */
+            objects?: number;
+            proposed?: number;
+            /** @description Proposals for elements already reviewed, or unchanged */
+            skipped?: number;
+            /** @description The ontology version the proposals were written in */
+            version?: number | null;
+            error?: string;
+            /** Format: date-time */
+            started_at?: string;
+            /** Format: date-time */
+            finished_at?: string;
         };
         Ontology: {
             tenant_id: string;
@@ -5254,6 +6169,12 @@ export interface components {
             injection?: {
                 /** @description Least share of attacks blocked. Default 1 (every attack). An injection eval is required for versions with write tools whatever the bar. */
                 min_pass_rate: number;
+                /**
+                 * @description Read-only versions (read tools, no write tool): `required` gates them on an injection eval too (their answer can be steered by what they read); `optional` lets them promote without one. A finished injection eval is checked against the bar either way.
+                 * @default required
+                 * @enum {string}
+                 */
+                read_only?: "required" | "optional";
             };
         };
         EvalPolicyView: {
@@ -5261,7 +6182,7 @@ export interface components {
             object: "node.eval_policy";
             node: string;
             policy: components["schemas"]["EvalPolicy"];
-            /** @description The injection bar in effect for versions with write tools (default 1) */
+            /** @description The injection bar in effect for versions with write tools and read-only versions (default 1) */
             injection_bar: number;
             /** Format: date-time */
             updated_at?: string | null;
@@ -5474,8 +6395,23 @@ export interface components {
                 /** @description Widest map reached */
                 fanout_used?: number;
             };
-            /** @description What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events */
+            /** @description What the run spent on model calls so far (USD): the sum of `charged_usd` over its usage events. For a run `caliban/auto` started, the flat auto price. */
             cost_usd?: number;
+            /** @description The real cost of the models its calls were routed to; equals `cost_usd` unless the run is billed as `caliban/auto`. */
+            model_cost_usd?: number;
+            /** @description The answer guard (docs/nodes.md): present when the final output carried untrusted labels. */
+            answer_check?: {
+                labels?: string[];
+                findings?: {
+                    /** @enum {string} */
+                    rule?: "untrusted_link" | "untrusted_contact" | "untrusted_reference" | "instruction_echo";
+                    label?: string;
+                    /** @description JSON pointer into the output */
+                    at?: string;
+                }[];
+                /** @enum {string} */
+                action?: "passed" | "redacted" | "refused";
+            };
             usage?: components["schemas"]["RunUsage"];
             steps: components["schemas"]["RunStep"][];
             /** @description How many times a worker claimed the run (more than 1 after a takeover or a resume) */
@@ -5528,6 +6464,8 @@ export interface components {
             prompt_tokens: number;
             completion_tokens: number;
             total_tokens: number;
+            /** @description Personal-data entities the gateway protected in the run's model calls */
+            pii_entities?: number;
         };
         RunStep: {
             /** @description Deterministic step id, e.g. classify#0, fanout#0/3, agent#2.1 */
@@ -5539,7 +6477,11 @@ export interface components {
             tokens: number;
             prompt_tokens?: number;
             completion_tokens?: number;
+            /** @description What the step's model call is billed */
             usd: number;
+            /** @description The routed model's real cost (differs from `usd` only for calls billed as `caliban/auto`) */
+            model_cost_usd?: number;
+            pii_entities?: number;
             /** @description Taint labels of the step's output */
             labels: string[];
             /** Format: date-time */
@@ -5769,6 +6711,11 @@ export interface components {
             route?: string;
             /** @description In transit only (never in reports): why a model answered rather than a node; counted in `by_route` */
             route_fallback?: string;
+            /**
+             * @description Work Caliban did on the tenant's behalf: `rag.ingest` (embedding a collection's documents), `rag.search` (a node's retrieval query, its embedding and reranking). Absent for client calls and node model calls. Kept in reports (billing-class, not content-class).
+             * @enum {string}
+             */
+            purpose?: "rag.ingest" | "rag.search";
         };
         UsageReport: {
             events: components["schemas"]["UsageEvent"][];
@@ -5786,6 +6733,11 @@ export interface components {
             by_node?: {
                 node?: string;
                 node_version?: number;
+                totals?: components["schemas"]["UsageTotals"];
+            }[];
+            /** @description The same totals per `purpose` (retrieval spend, separable from the tenant's own calls), raw and rolled-up days. */
+            by_purpose?: {
+                purpose?: string;
                 totals?: components["schemas"]["UsageTotals"];
             }[];
             totals: components["schemas"]["UsageTotals"];
@@ -5860,8 +6812,145 @@ export interface components {
         };
         /** @enum {string} */
         Role: "owner" | "admin" | "auditor" | "tenant_admin" | "developer" | "viewer" | "billing";
+        RagCollectionSettings: {
+            /**
+             * @description Largest chunk, in estimated tokens (structure-aligned, no overlap)
+             * @default 384
+             */
+            chunk_tokens?: number;
+            /**
+             * @description Trust of documents ingested without one
+             * @default untrusted
+             * @enum {string}
+             */
+            default_trust?: "trusted" | "untrusted";
+            /**
+             * @description Documents with at least this many chunks get a navigation tree
+             * @default 24
+             */
+            nav_min_chunks?: number;
+            /**
+             * @description An untrusted document whose checks have not passed this long after ingest (or after its release, for a released version) fails (stays invisible)
+             * @default 900
+             */
+            vet_deadline_secs?: number;
+        };
+        RagCollection: {
+            id: string;
+            tenant_id: string;
+            /** @description What node scopes name: rag.<name>:read */
+            name: string;
+            description?: string;
+            embedding_model: string;
+            rerank_model?: string;
+            settings: components["schemas"]["RagCollectionSettings"];
+            /** Format: date-time */
+            created_at: string;
+            created_by: string;
+            /** @description In the listing only: documents per status (`pending`, `ready`, `quarantined`, ...), counting each document's newest version as the document listing shows it; deleted documents are not counted. */
+            document_counts?: {
+                [key: string]: number;
+            };
+        };
+        RagModel: {
+            id: string;
+            provider: string;
+            /** @enum {string} */
+            trust_tier: "t0_sovereign" | "t1_attested" | "t2_contracted" | "t3_public";
+        };
+        RagCollectionCreate: {
+            name: string;
+            description?: string;
+            /** @description A catalogue model of kind embedding the tenant can reach */
+            embedding_model: string;
+            /** @description A catalogue model of kind rerank the tenant can reach */
+            rerank_model?: string;
+            settings?: components["schemas"]["RagCollectionSettings"];
+        };
+        /**
+         * @description Only `ready` versions are served.
+         * @enum {string}
+         */
+        RagDocumentStatus: "pending" | "indexing" | "ready" | "quarantined" | "failed" | "superseded" | "deleted";
+        RagFinding: {
+            /** @description instruction, exfiltration, hidden_unicode, url or near_duplicate */
+            kind: string;
+            /** @description The chunk (0-based) it was found in */
+            chunk: number;
+            /** @description The headings above that chunk, so a reviewer can find the place in the source. Pseudonymised like the indexed text, at most 80 characters each, hidden characters removed. Never an excerpt of what triggered the finding. */
+            heading_path?: string[];
+        };
+        RagDocumentIngest: {
+            /** @description Visible ASCII without /. Stored in clear: no personal data */
+            doc_id: string;
+            title?: string;
+            /** @description At most 5 MB */
+            content: string;
+            /**
+             * @description text/markdown, text/html or text/plain
+             * @default text/markdown
+             */
+            content_type?: string;
+            /** @description Where it came from (stored in clear: no personal data) */
+            source?: string;
+            /**
+             * @description Default: the collection's default_trust
+             * @enum {string}
+             */
+            trust?: "trusted" | "untrusted";
+            /**
+             * Format: date-time
+             * @description Not retrieved before
+             */
+            valid_from?: string;
+            /**
+             * Format: date-time
+             * @description Not retrieved after (citations state it)
+             */
+            valid_to?: string;
+        };
+        RagDocument: {
+            tenant_id: string;
+            collection_id: string;
+            doc_id: string;
+            version: number;
+            content_type: string;
+            source?: string;
+            /** @enum {string} */
+            trust: "trusted" | "untrusted";
+            bytes: number;
+            /** Format: date-time */
+            valid_from?: string;
+            /** Format: date-time */
+            valid_to?: string;
+            status: components["schemas"]["RagDocumentStatus"];
+            chunks: number;
+            /** @description Estimated tokens of its chunks */
+            tokens: number;
+            /** @description Personal-data entities pseudonymised before embedding */
+            pii_entities: number;
+            findings: components["schemas"]["RagFinding"][];
+            findings_acknowledged: boolean;
+            error?: string;
+            attempts: number;
+            /** Format: date-time */
+            created_at: string;
+            created_by: string;
+            /** Format: date-time */
+            indexed_at?: string;
+            released_by?: string;
+            /** Format: date-time */
+            released_at?: string;
+            /**
+             * Format: date-time
+             * @description Untrusted documents only: when its checks must have passed, or it fails. The collection's `vet_deadline_secs` from ingest, or from its release for a released version.
+             */
+            vet_deadline_at?: string;
+            /** @description In the document listing: the version being served */
+            live_version?: number | null;
+        };
         /** @enum {string} */
-        Permission: "tenants.create" | "catalog.read" | "catalog.write" | "providers.probe" | "audit.read" | "rbac.read" | "rbac.write" | "tenant.read" | "tenant.write" | "tenant.delete" | "api_keys.read" | "api_keys.write" | "provider_keys.read" | "provider_keys.write" | "routes.read" | "routes.write" | "datasources.read" | "datasources.write" | "ontology.read" | "ontology.review" | "nodes.read" | "nodes.write" | "nodes.publish" | "nodes.run" | "tools.read" | "tools.write" | "tools.approve" | "runs.read" | "runs.data" | "runs.answer" | "usage.read";
+        Permission: "tenants.create" | "catalog.read" | "catalog.write" | "providers.probe" | "audit.read" | "rbac.read" | "rbac.write" | "tenant.read" | "tenant.write" | "tenant.delete" | "api_keys.read" | "api_keys.write" | "provider_keys.read" | "provider_keys.write" | "routes.read" | "routes.write" | "datasources.read" | "datasources.write" | "ontology.read" | "ontology.review" | "nodes.read" | "nodes.write" | "nodes.publish" | "nodes.run" | "tools.read" | "tools.write" | "tools.approve" | "rag.read" | "rag.write" | "rag.approve" | "runs.read" | "runs.data" | "runs.answer" | "usage.read";
         RoleInfo: {
             role: components["schemas"]["Role"];
             /** @enum {string} */

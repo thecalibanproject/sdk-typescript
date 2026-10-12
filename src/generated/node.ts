@@ -39,11 +39,15 @@ export interface NodeSpec {
     escalate_on?: ('schema_violation' | 'low_confidence' | 'tool_error')[];
     max_cost_usd?: number;
     min_trust_tier?: 't0_sovereign' | 't1_attested' | 't2_contracted' | 't3_public';
+    /**
+     * Default reasoning effort of the node's model calls (a vertex's config.reasoning overrides it); mapped per model family by the gateway
+     */
+    reasoning?: 'off' | 'low' | 'medium' | 'high';
     [k: string]: unknown;
   };
   tools?: {
     /**
-     * mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN or builtin://datasource_query
+     * mcp://server/tool#sha256:<hash> (an approved manifest), node://name@vN, builtin://datasource_query or builtin://rag_search
      */
     ref: string;
     effect: 'read' | 'write';
@@ -55,6 +59,9 @@ export interface NodeSpec {
     [k: string]: unknown;
   }[];
   datasources?: {
+    /**
+     * <datasource>.<object or *>:<read|write> for datasources; rag.<collection or *>:read for document collections (builtin://rag_search)
+     */
     scopes?: string[];
     [k: string]: unknown;
   };
@@ -68,6 +75,13 @@ export interface NodeSpec {
     [k: string]: unknown;
   };
   guardrails?: {
+    /**
+     * The answer guard on the run's final output when it carries untrusted labels: links, contacts and references that only untrusted free text supplied, and echoes of injected instructions, are removed (redact) or fail the run (refuse).
+     */
+    answer?: 'redact' | 'refuse' | 'off';
+    /**
+     * A floor on the personal-data protection of the node's model calls, on every model class (sovereign models included), and of untrusted tool arguments and results. Only strengthens the tenant's mode.
+     */
     pii?: 'off' | 'mask' | 'reversible';
     injection_mode?: 'none' | 'plan_then_execute' | 'camel';
     egress?: string[];
@@ -125,7 +139,18 @@ export interface NodeSpec {
        * code is not yet supported (refused at publish)
        */
       type: 'llm' | 'tool' | 'router' | 'map' | 'reduce' | 'verify' | 'human' | 'subnode' | 'code';
+      /**
+       * Per vertex type (docs/nodes.md). Model vertices (llm, router, verify, reduce with mode llm) also take reasoning and structured_output.
+       */
       config?: {
+        /**
+         * Reasoning effort of this vertex's model call, mapped per model family by the gateway (Qwen3 enable_thinking, reasoning_effort); overrides model_policy.reasoning
+         */
+        reasoning?: 'off' | 'low' | 'medium' | 'high';
+        /**
+         * With an output_schema (llm, reduce) and for router labels: json_schema asks the server for constrained decoding (response_format json_schema; vLLM and SGLang guided decoding, OpenAI structured outputs); prompt puts the schema in the prompt only. The answer is validated either way.
+         */
+        structured_output?: 'json_schema' | 'prompt';
         [k: string]: unknown;
       };
       max_iterations?: number;
