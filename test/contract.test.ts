@@ -18,6 +18,7 @@ import type {
   ModelList,
   OntologyDecision,
   OntologyReview,
+  PiiFloor,
   PiiSurrogateScope,
   ProviderHealth,
   RagModel,
@@ -53,6 +54,7 @@ describe('contract alignment (type-level)', () => {
     expect(typeof toContract).toBe('function');
     expectTypeOf<CalibanExtension>().toEqualTypeOf<Schemas['CalibanExtension']>();
     expectTypeOf<NonNullable<CalibanExtension['pii']>>().toEqualTypeOf<'off' | 'mask' | 'reversible'>();
+    expectTypeOf<PiiFloor>().toEqualTypeOf<'off' | 'mask' | 'reversible'>();
     expect(true).toBe(true);
   });
 

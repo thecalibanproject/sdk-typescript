@@ -21,6 +21,14 @@ export type NodeGraph = NonNullable<NodeSpec['graph']>;
 export type NodeVertex = NonNullable<NodeGraph['vertices']>[number];
 export type NodeEdge = NonNullable<NodeGraph['edges']>[number];
 export type TrustTier = NonNullable<NodeModelPolicy['min_trust_tier']>;
+/** A vertex's `config`; model vertices (`llm`, `router`, `verify`, `reduce` with mode `llm`) also take `reasoning` and `structured_output`. */
+export type NodeVertexConfig = NonNullable<NodeVertex['config']>;
+/** Reasoning effort of a node's model calls (`model_policy.reasoning`, overridden per vertex by `config.reasoning`). */
+export type NodeReasoning = NonNullable<NodeModelPolicy['reasoning']>;
+/** `json_schema` (default: constrained decoding on the server) or `prompt` (the schema in the prompt only). */
+export type NodeStructuredOutput = NonNullable<NodeVertexConfig['structured_output']>;
+/** `guardrails.answer`: `redact` (default), `refuse` or `off`. */
+export type NodeAnswerGuard = NonNullable<NodeGuardrails['answer']>;
 
 /**
  * Author a node spec with full editor completion and type-checking against

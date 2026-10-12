@@ -6,10 +6,13 @@ import {
   CalibanStreamError,
   RunEventStream,
   type NodeRun,
+  type RunAnswerCheck,
+  type RunAnswerFinding,
   type RunCreateParams,
   type RunEvent,
   type RunEventType,
   type RunStatus,
+  type RunUsage,
   type UntrustedInput,
 } from '../src/index.js';
 import type { paths } from '../src/generated/schema.js';
@@ -41,6 +44,35 @@ function frame(ev: RunEvent): string {
 }
 
 describe('runs', () => {
+  it('reports the billed and real cost, protected PII and the answer guard on a run', async () => {
+    const guarded: NodeRun = {
+      ...run,
+      cost_usd: 0.004,
+      model_cost_usd: 0.0011,
+      usage: { prompt_tokens: 900, completion_tokens: 120, total_tokens: 1020, pii_entities: 3 },
+      answer_check: {
+        labels: ['datasource'],
+        findings: [{ rule: 'untrusted_contact', label: 'datasource', at: '/advice' }],
+        action: 'redacted',
+      },
+    };
+    const m = mockFetch(json(guarded));
+    const res = await client(m.fetch).runs.get('run_1');
+    expect([res.cost_usd, res.model_cost_usd, res.usage?.pii_entities]).toEqual([0.004, 0.0011, 3]);
+    expect(res.answer_check?.action).toBe('redacted');
+    const finding: RunAnswerFinding | undefined = res.answer_check?.findings?.[0];
+    expect(finding).toEqual({ rule: 'untrusted_contact', label: 'datasource', at: '/advice' });
+    expectTypeOf<RunAnswerCheck['action']>().toEqualTypeOf<'passed' | 'redacted' | 'refused' | undefined>();
+    expectTypeOf<RunAnswerFinding['rule']>().toEqualTypeOf<
+      'untrusted_link' | 'untrusted_contact' | 'untrusted_reference' | 'instruction_echo' | undefined
+    >();
+    expectTypeOf<RunUsage['pii_entities']>().toEqualTypeOf<number | undefined>();
+    // A run from an older server has none of them.
+    const old = mockFetch(json(run));
+    const plain = await client(old.fetch).runs.get('run_1');
+    expect([plain.model_cost_usd, plain.answer_check]).toEqual([undefined, undefined]);
+  });
+
   it('starts a sync run and returns the run with header metadata', async () => {
     const m = mockFetch(json(run, { headers: { 'x-caliban-request-id': 'req_1' } }));
     const res = await client(m.fetch).runs.create('triage', { input: { case: 'Chest pain' }, version: 3, wait_s: 5 });

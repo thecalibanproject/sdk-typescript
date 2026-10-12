@@ -6,6 +6,12 @@ type Schemas = components['schemas'];
 /** The `caliban` request extension (contract: `CalibanExtension`). Unknown to plain OpenAI clients. */
 export type CalibanExtension = Schemas['CalibanExtension'];
 export type PiiMode = NonNullable<CalibanExtension['pii']>;
+/**
+ * `caliban.pii_floor`: a minimum PII protection applied to every model class, sovereign and
+ * attested models included. Only strengthens: the request gets the stricter of this and `pii` (or
+ * the tenant's mode), ordered `off` < `reversible` < `mask`. A node's `guardrails.pii` sets it.
+ */
+export type PiiFloor = NonNullable<CalibanExtension['pii_floor']>;
 export type CacheMode = NonNullable<CalibanExtension['cache']>;
 /**
  * `caliban.reasoning`: how hard a reasoning model should think. Caliban maps it per model family
@@ -316,7 +322,16 @@ export type NodeRun = Schemas['NodeRun'];
 /** `pending`, `running`, `sleeping`, `input_required`, `succeeded`, `failed`, `budget_exhausted` or `cancelled`. */
 export type RunStatus = Schemas['RunStatus'];
 export type RunStep = Schemas['RunStep'];
+/** Tokens of a run's model calls, and `pii_entities`: the personal-data entities the gateway protected in them. */
 export type RunUsage = Schemas['RunUsage'];
+/**
+ * The answer guard's record (`NodeRun.answer_check`), present when the final output carried
+ * untrusted labels: the output's `labels`, the `findings` by rule, label and JSON pointer (never
+ * their text) and the `action` (`passed`, `redacted` or `refused`).
+ */
+export type RunAnswerCheck = NonNullable<NodeRun['answer_check']>;
+/** One finding of the answer guard: `untrusted_link`, `untrusted_contact`, `untrusted_reference` or `instruction_echo`. */
+export type RunAnswerFinding = NonNullable<RunAnswerCheck['findings']>[number];
 /** One event of a run's stream (contract: `RunEvent`); `run` on the last event of a stream. */
 export type RunEvent = Schemas['RunEvent'];
 export type RunEventType = RunEvent['type'];

@@ -2,10 +2,14 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   defineNode,
   type NodeAgent,
+  type NodeAnswerGuard,
   type NodeGuards,
+  type NodeReasoning,
   type NodeSpec,
+  type NodeStructuredOutput,
   type NodeTool,
   type NodeToolRef,
+  type NodeVertexConfig,
 } from '../src/index.js';
 
 describe('defineNode', () => {
@@ -111,6 +115,46 @@ describe('defineNode', () => {
     expectTypeOf<'mcp://erp/approve#sha256:ab'>().toExtend<NodeToolRef>();
     expectTypeOf<'node://kb@v2'>().toExtend<NodeToolRef>();
     expectTypeOf<'https://example.com'>().not.toExtend<NodeToolRef>();
+  });
+
+  it('accepts per-vertex reasoning and structured output, and the answer guard', () => {
+    const triage = defineNode({
+      kind: 'workflow',
+      prompt: { system: 'Triage the case.', output_schema: { type: 'object', required: ['urgency'] } },
+      model_policy: { reasoning: 'low' },
+      tools: [{ ref: 'builtin://datasource_query', effect: 'read' }],
+      guardrails: { answer: 'refuse', pii: 'mask' },
+      budgets: { steps: 10, tokens: 10_000, wall_clock_s: 60 },
+      graph: {
+        vertices: [
+          { id: 'route', type: 'router', config: { routes: { urgent: 'now', routine: 'later' }, reasoning: 'off' } },
+          { id: 'advise', type: 'llm', config: { reasoning: 'high', structured_output: 'prompt' } },
+        ],
+        edges: [{ from: 'route', to: 'advise' }],
+      },
+    });
+    expect(triage.graph.vertices[1].config.structured_output).toBe('prompt');
+    expect(triage.guardrails.answer).toBe('refuse');
+    expectTypeOf<NodeReasoning>().toEqualTypeOf<'off' | 'low' | 'medium' | 'high'>();
+    expectTypeOf<NodeStructuredOutput>().toEqualTypeOf<'json_schema' | 'prompt'>();
+    expectTypeOf<NodeAnswerGuard>().toEqualTypeOf<'redact' | 'refuse' | 'off'>();
+    expectTypeOf<NodeVertexConfig['reasoning']>().toEqualTypeOf<NodeReasoning | undefined>();
+
+    defineNode({
+      kind: 'agent',
+      prompt: { system: 'x' },
+      model_policy: {},
+      budgets: { steps: 1, tokens: 1, wall_clock_s: 1 },
+      // @ts-expect-error guardrails.answer is redact | refuse | off
+      guardrails: { answer: 'block' },
+    });
+    defineNode({
+      kind: 'workflow',
+      prompt: { system: 'x' },
+      // @ts-expect-error model_policy.reasoning is off | low | medium | high
+      model_policy: { reasoning: 'max' },
+      budgets: { steps: 1, tokens: 1, wall_clock_s: 1 },
+    });
   });
 
   it('rejects unknown keys in guards (additionalProperties: false) at compile time', () => {

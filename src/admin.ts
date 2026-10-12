@@ -15,6 +15,10 @@ export type TenantUpdate = Schemas['TenantUpdate'];
 export type PiiSurrogateScope = NonNullable<Tenant['pii_surrogate_scope']>;
 /** `semantic_cache` tenant setting: `off` (default) or `on`. */
 export type SemanticCacheSetting = NonNullable<Tenant['semantic_cache']>;
+/** One of the tenant's own L0 PII patterns (contract: `PiiPattern`): a `label` and a linear-time Rust `regex`. */
+export type PiiPattern = Schemas['PiiPattern'];
+/** One term of the tenant's PII dictionary (contract: `PiiTerm`): whole-word, case-insensitive. */
+export type PiiTerm = Schemas['PiiTerm'];
 export type ApiKeyInfo = Schemas['ApiKeyInfo'];
 export type ApiKeyCreated = Schemas['ApiKeyCreated'];
 export type ProviderKind = Schemas['ProviderKind'];
@@ -121,6 +125,10 @@ export type UsageReport = Schemas['UsageReport'];
 export type UsageEvent = Schemas['UsageEvent'];
 /** `UsageReport.totals`. */
 export type UsageTotals = UsageReport['totals'];
+/** Work Caliban did on the tenant's behalf (`rag.ingest`, `rag.search`); absent on client calls and node model calls. */
+export type UsagePurpose = NonNullable<UsageEvent['purpose']>;
+/** `UsageReport.by_purpose`: the totals per purpose, so retrieval spend is separable from the tenant's own calls. */
+export type UsageByPurpose = NonNullable<UsageReport['by_purpose']>[number];
 export type Health = Schemas['Health'];
 /** `NodeCreate` with `spec` typed against node.schema.json instead of a free-form object. */
 export type NodeCreate = Omit<Schemas['NodeCreate'], 'spec'> & { spec: NodeSpec };
@@ -147,7 +155,9 @@ export interface GoldenSetPut {
 }
 /** A node's promotion bar (contract: `EvalPolicy`). */
 export type EvalPolicy = Schemas['EvalPolicy'];
-/** The bar in effect (contract: `EvalPolicyView`); `injection_bar` applies to versions with write tools. */
+/** Whether read-only versions need an injection eval to promote: `required` (default) or `optional`. */
+export type InjectionReadOnly = NonNullable<NonNullable<EvalPolicy['injection']>['read_only']>;
+/** The bar in effect (contract: `EvalPolicyView`); `injection_bar` applies to versions with write tools and to read-only versions. */
 export type EvalPolicyView = Schemas['EvalPolicyView'];
 /** An eval of a node version (contract: `Eval`). `summary` (metrics only) is null until it ends; `trials` only on `evals.get()`. */
 export type Eval = Schemas['Eval'];

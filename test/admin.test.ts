@@ -16,9 +16,14 @@ import {
   type GoldenCase,
   type GoldenSummary,
   type GoldenVerdict,
+  type InjectionReadOnly,
   type InjectionVerdict,
   type OntologyElement,
+  type PiiPattern,
+  type PiiTerm,
   type Problem,
+  type UsageByPurpose,
+  type UsagePurpose,
 } from '../src/index.js';
 import { fastRetry, json, mockFetch } from './helpers.js';
 
@@ -247,6 +252,45 @@ describe('CalibanAdmin', () => {
     expect(cleared.auto_cache_hit_fraction).toBeNull();
   });
 
+  it('sets the tenant PII patterns, dictionary and sovereign switch', async () => {
+    const patterns: PiiPattern[] = [{ label: 'MRN', pattern: 'MRN-[0-9]{6}' }];
+    const dictionary: PiiTerm[] = [{ term: 'Project Lumen', label: 'ORG' }];
+    const updated = { ...tenant, pii_on_sovereign: true, pii_patterns: patterns, pii_dictionary: dictionary };
+    const m = mockFetch(json(updated), json({ ...updated, pii_patterns: [], pii_dictionary: [] }));
+    const a = admin(m.fetch);
+    const t = await a.tenants.update('t_1', { pii_on_sovereign: true, pii_patterns: patterns, pii_dictionary: dictionary });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ pii_on_sovereign: true, pii_patterns: patterns, pii_dictionary: dictionary });
+    expect([t.pii_on_sovereign, t.pii_patterns, t.pii_dictionary]).toEqual([true, patterns, dictionary]);
+    // Lists are replaced as a whole: [] clears them.
+    const cleared = await a.tenants.update('t_1', { pii_patterns: [], pii_dictionary: [] });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ pii_patterns: [], pii_dictionary: [] });
+    expect(cleared.pii_patterns).toEqual([]);
+    // @ts-expect-error a pattern is closed: `flags` is not a field
+    const bad: PiiPattern = { label: 'X', pattern: 'x', flags: 'i' };
+    expect(bad).toBeDefined();
+  });
+
+  it('reports usage per purpose', async () => {
+    const totals = { requests: 4, cost_usd: 0.002 };
+    const report = {
+      events: [{ request_id: 'r1', tenant_id: 't_1', model: 'local/bge-m3', prompt_tokens: 50, completion_tokens: 0, cache: 'bypass', latency_ms: 4, ts: 'x', purpose: 'rag.search' }],
+      by_purpose: [
+        { purpose: 'rag.ingest', totals: { requests: 3, cost_usd: 0.0015 } },
+        { purpose: 'rag.search', totals: { requests: 1, cost_usd: 0.0005 } },
+      ],
+      totals,
+    };
+    const m = mockFetch(json(report));
+    const usage = await admin(m.fetch).usage.get({ tenant_id: 't_1' });
+    expect(usage.events[0]?.purpose).toBe('rag.search');
+    const byPurpose: UsageByPurpose[] = usage.by_purpose ?? [];
+    expect(byPurpose.map((p) => [p.purpose, p.totals?.requests])).toEqual([
+      ['rag.ingest', 3],
+      ['rag.search', 1],
+    ]);
+    expectTypeOf<UsagePurpose>().toEqualTypeOf<'rag.ingest' | 'rag.search'>();
+  });
+
   it('PATCH throws a not-found CalibanAPIError on 404', async () => {
     const m = mockFetch(json({ error: { message: 'no such tenant', type: 'not_found', code: null } }, { status: 404 }));
     await expect(admin(m.fetch).tenants.update('gone', { semantic_cache: 'on' })).rejects.toMatchObject({
@@ -418,6 +462,21 @@ describe('CalibanAdmin node evals', () => {
     expect((await a.evalPolicy.put('t_1', 'desk', policy)).policy).toEqual(policy);
     expect(m.calls[1]).toMatchObject({ method: 'PUT', url: `${N}/eval-policy` });
     expect(JSON.parse(m.calls[1]!.body!)).toEqual(policy);
+  });
+
+  it('makes the injection eval optional for read-only versions', async () => {
+    const policy: EvalPolicy = { injection: { min_pass_rate: 1, read_only: 'optional' } };
+    const view = { object: 'node.eval_policy', node: 'desk', policy, injection_bar: 1 };
+    const m = mockFetch(
+      json(view),
+      json({ node: 'desk', version: 4, has_write_tools: false, has_untrusted_reads: true, allowed: true, evidence: null, problems: [] }),
+    );
+    const a = admin(m.fetch);
+    await a.evalPolicy.put('t_1', 'desk', policy);
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ injection: { min_pass_rate: 1, read_only: 'optional' } });
+    const gate = await a.evals.gate('t_1', 'desk', 4);
+    expect([gate.has_write_tools, gate.has_untrusted_reads, gate.allowed]).toEqual([false, true, true]);
+    expectTypeOf<InjectionReadOnly>().toEqualTypeOf<'required' | 'optional'>();
   });
 
   it('starts an eval as the eval key or a named api key', async () => {

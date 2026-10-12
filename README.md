@@ -85,6 +85,7 @@ Every data-plane request body can carry a `caliban` object. Clients that do not 
 | Field | Values | Meaning |
 |---|---|---|
 | `pii` | `off`, `mask`, `reversible` | How PII is handled before text leaves your trust boundary. `mask` replaces entities with placeholders such as `[EMAIL]`; `reversible` pseudonymises them and restores the originals in the response. |
+| `pii_floor` | `off`, `mask`, `reversible` | A minimum protection applied to every model class, sovereign and attested models included. It only strengthens: the request gets the stricter of this and `pii` (or the tenant's mode), ordered `off` < `reversible` < `mask`. A node's `guardrails.pii` sets it on the node's calls. |
 | `cache` | `off`, `exact`, `semantic` | Response cache mode. `off`: no cache. `exact`: exact cache only. `semantic`: exact, then the semantic cache if the tenant has it on, whatever the temperature. Left out: exact, plus semantic up to the gateway's temperature limit if the tenant has it on (see [Tenant settings](#tenant-settings)). |
 | `datasources` | `string[]` | Datasources (by name) the request may query through the ontology layer. |
 | `node` | `string` | Run the request through a named node (agent). |
@@ -241,7 +242,7 @@ while (['pending', 'running', 'sleeping'].includes(run.status)) {
   await new Promise((r) => setTimeout(r, 1000));
   run = await caliban.runs.get(run.id);
 }
-console.log(run.status, run.output, run.cost_usd);
+console.log(run.status, run.output, run.cost_usd, run.model_cost_usd, run.usage?.pii_entities);
 
 // Stream the run's events (SSE) instead.
 const stream = await caliban.runs.create('invoice-triage', { input: { invoice_id: 'INV-43' }, stream: true });
@@ -258,6 +259,7 @@ console.log(stream.run?.status); // the run, from the last event
   });
   console.log(run.input_labels); // ['caller']
   ```
+- **Cost, PII and the answer guard.** `cost_usd` is what the run is billed (for a run `caliban/auto` started, the flat auto price) and `model_cost_usd` the real cost of the models its calls were routed to; they differ only for runs billed as `caliban/auto`, and each step carries the same pair (`usd`, `model_cost_usd`). `usage.pii_entities` counts the personal-data entities the gateway protected in the run's model calls. `answer_check` (`RunAnswerCheck`) is present when the final output carried untrusted labels: the output's `labels`, the `findings` by rule (`untrusted_link`, `untrusted_contact`, `untrusted_reference`, `instruction_echo`), label and JSON pointer, never their text, and the `action` (`passed`, `redacted` or `refused`). See the node's `guardrails.answer` under [`defineNode`](#definenode-node-authoring).
 - `async: true` answers at once with the pending run; poll `runs.get()` or follow `runs.events()`. `version` runs a published version other than the live one (`runs.list({ node, version })` filters by it); `budget` can only lower the version's budget for this run; `chat: { messages }` replaces `input` with chat messages.
 - A `RunEventStream` yields `RunEvent`s (`run.created`, `step.started`, `step.finished`, `run.input_required`, `run.sleeping`, `run.input_received`, `run.cancel_requested`, `run.finished`). The server ends it after `run.finished`, or after `run.input_required` while the run waits; that last event carries the run (`stream.run`, or `await stream.finalRun()`). Events never carry step content. `stream.runId` is the `Caliban-Run-Id` header. The timeout covers the time until headers arrive; the stream is not retried or resumed by itself: resume with `runs.events(runId, { after: stream.lastEventId })`.
 - `runs.input()` answers the step the run waits for (`awaiting.step`, or `step`). A step named `<step>@approve` asks to approve a write whose arguments carry untrusted taint labels: answer `{ approve: true }` or `{ approve: false }`. Not waiting for that step is a `409` (`run_not_awaiting_input`).
@@ -343,6 +345,9 @@ Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body r
 |---|---|---|---|
 | `pii_default` | `off`, `mask`, `reversible` | `reversible` | PII mode for requests that do not set `caliban.pii`. |
 | `pii_surrogate_scope` | `tenant`, `session` | `tenant` | How reversible PII surrogates are chosen. |
+| `pii_on_sovereign` | `boolean` | `false` | Also apply the tenant's PII mode to models inside the trust boundary (`t0_sovereign`, `t1_attested`). Off, those models receive the text as is. External models always get the mode, and `caliban.pii_floor` (a node's `guardrails.pii`) applies to every model class. |
+| `pii_patterns` | `PiiPattern[]` (at most 50) | `[]` | The tenant's own L0 detection patterns: `{ label, pattern }`. `NATIONAL_ID`, `PHONE`, `EMAIL`, `PERSON`, `ORG`, `LOCATION`, `IBAN` and `CARD` use the built-in surrogates; other labels get shape-preserving ones. `pattern` uses the Rust `regex` syntax (linear time: no backreferences or lookaround) and must not match the empty string. Replaced as a whole; `[]` clears them. |
+| `pii_dictionary` | `PiiTerm[]` (at most 10 000) | `[]` | Whole-word, case-insensitive terms to protect: `{ term, label }` (customer names, internal codes). Replaced as a whole; `[]` clears it. Audited as a count of terms, never the terms. |
 | `semantic_cache` | `off`, `on` | `off` | Whether the tenant's eligible requests may use the semantic cache. |
 | `auto_cache_hit_fraction` | `0` to `1`, or `null` | `null` | Share of the flat `caliban/auto` price billed for the tenant's cache hits. `null` uses the deployment's `[routing] auto_cache_hit_fraction` (0.2 unless configured); sending `null` clears an override. |
 | `node_caps` | `{ steps, tokens, wall_clock_s, depth, fanout, usd? }`, or `null` | `null` | Caps on the budgets of published node versions. `null` restores the defaults (steps 200, tokens 2 000 000, wall_clock_s 3600, depth 5, fanout 32). With `usd` set, every version must declare `budgets.usd` within it. |
@@ -357,6 +362,7 @@ console.log(t.pii_surrogate_scope, t.semantic_cache); // 'session' 'on'
 
 - **`pii_surrogate_scope: 'tenant'`** (the default): a given value always gets the same surrogate within the tenant (a keyed HMAC per tenant, derived from `CALIBAN_KEK`). That lets pseudonymised requests hit the exact cache. The trade-off is linkability: anyone who can see the pseudonymised traffic (an upstream provider, for example) can tell that two requests or sessions of the tenant mention the same person, even without learning who it is. Surrogates never cross tenants.
 - **`pii_surrogate_scope: 'session'`**: every request gets fresh surrogates, so requests cannot be linked through them. Requests that carry PII then bypass the exact and semantic caches.
+- **`pii_patterns` and `pii_dictionary`** are the deterministic first tier of PII detection, compiled per tenant (see [research note 05](https://github.com/thecalibanproject/docs/blob/main/research/05-anonymization-and-privacy.md)): `await admin.tenants.update(t, { pii_patterns: [{ label: 'MRN', pattern: 'MRN-[0-9]{6}' }], pii_dictionary: [{ term: 'Project Lumen', label: 'ORG' }] })`.
 - **`auto_cache_hit_fraction`**: a cache hit (exact or semantic) calls no model, so a `caliban/auto` request answered from cache is billed this share of the flat price. Out of range is a `422`.
 - **`semantic_cache: 'on'`**: an eligible request may be answered with the response to an earlier, semantically similar request of the same tenant (same model, system prompt, history and parameters). Entries never cross tenants. The deployment must also enable it (`[cache.semantic] enabled`). Hits report `x-caliban-cache: hit` with `x-caliban-cache-tier: semantic`.
 
@@ -375,8 +381,11 @@ Tenants from an older server omit the fields it does not know, so they are `unde
 | `flat_price_usd` | `caliban/auto` | The full flat auto price for the same tokens. On a cache hit, the flat price of the cached answer's tokens (what a miss would have billed). |
 | `billed_usd` | `caliban/auto` | What the customer is billed: `flat_price_usd` on a miss, `flat_price_usd` x the tenant's cache-hit fraction on a hit. |
 | `saved_usd` | Priced cache hits | What the hit saved: `flat_price_usd - billed_usd` for `caliban/auto`, the avoided model cost for other models. |
+| `purpose` | Work Caliban did for the tenant | `rag.ingest` (embedding a collection's documents) or `rag.search` (a node's retrieval query, its embedding and reranking). Absent on client calls and node model calls. Kept in reports. |
 
 **Routing decisions are content-class**: which intent a request went to reveals its topic, so reports never carry them. `intent` is empty and `intent_confidence`, `route_stage`, `route` and `route_fallback` are absent on reported events (they exist only in transit between a data plane and the control plane). `by_route` counts requests per tenant, UTC day, intent, deciding stage and fallback reason instead (empty strings: not set); it is not computed when you filter by `node` or `run_id`. The `x-caliban-intent` response header still tells the caller of a request how it was routed.
+
+`by_purpose` gives the same totals per `purpose` (`UsageByPurpose[]`), so retrieval spend is separable from the tenant's own calls; it is absent from an older server.
 
 `totals` adds `charged_usd` (what the customer is charged: the billed `caliban/auto` price, the model's cost otherwise; over a run's events it equals the run's `cost_usd`), `semantic_cache_hits` (`cache_hits` counts both tiers), `saved_usd` (what cache hits saved, all models), `auto_requests` (requests for `caliban/auto`) and `auto_cache_hits`, and, summed over the `caliban/auto` events that carry both prices, `flat_price_usd`, `billed_usd`, `auto_saved_usd`, `routed_model_cost_usd` and `margin_usd` (`billed_usd - routed_model_cost_usd`).
 
@@ -496,6 +505,7 @@ else console.log(gate.evidence);                 // GateEvidence: golden, inject
 - **The eval key.** Without `api_key_id`, trials and judge calls run as the tenant's eval key: an API key the control plane creates on the first such eval and manages (`purpose: 'eval'`). Its quotas apply and its usage is the eval's. `evalKey.get(tenantId)` shows it (`key` is `null` before that first eval; the plaintext is never returned, and the data plane refuses it on its endpoints); `evalKey.rotate(tenantId)` revokes it and creates a new one (`revoked` is the old id), so rotate between evals: evals in flight lose their key. `apiKeys.revoke()` on the eval key is a `409`. Pass `api_key_id` to run an eval as one of the tenant's own keys instead (active, allowed to run the node).
 - `summary` and each trial's `verdict` follow the eval's suite: narrow on `summary.suite` (`GoldenSummary` or `InjectionSummary`); a verdict is a `GoldenVerdict` (run status and each check's result), an `InjectionVerdict` (category, `succeeded`, `attacked`, the defenses that held) or `{ error }` when the trial's run could not be created. Run retention purges trial `detail` (`content_purged: true`); summaries and verdicts stay.
 - `evals.list(tenantId, { node, version, suite, status, limit, cursor })` returns one page (`data`, `next_cursor`), newest first, metrics and never content. `evals.trials(tenantId, evalId)` is `evals.get()` and its `trials`; each trial's `detail` (outputs, what the scorers said) is only there when the caller holds `runs.data`, and so are golden set `cases` (`content_visible`).
+- **Read-only versions.** A version with read tools that bring data in (MCP, `builtin://datasource_query`, `builtin://rag_search`) and no write tool needs an injection eval too, because what it reads can steer its answer (the suite's `answer_integrity` cases). `evalPolicy.put(t, node, { injection: { min_pass_rate: 1, read_only: 'optional' } })` lets such versions promote without one (`InjectionReadOnly`); a finished injection eval is still checked against the bar. `evals.gate()` reports `has_untrusted_reads` next to `has_write_tools`.
 - `evals.cancel()` ends a pending eval at once and asks a running one to stop (`cancel_requested: true`); an eval that already ended throws a `409`.
 - `goldenSets.put()` and `evalPolicy.put()` are `PUT`s, retried like a GET. `evals.start()` is a POST: retried on 429 and 503 only, unless you pass an `Idempotency-Key` header.
 - The control plane keeps evals next to the node journal; without one these calls answer `503`.
@@ -590,9 +600,30 @@ export const invoiceTriage = defineNode({
 await new CalibanAdmin().nodes.create({ tenant_id: 't_1', name: 'invoice-triage', spec: invoiceTriage });
 ```
 
+**Reasoning and constrained decoding.** `model_policy.reasoning` (`off`, `low`, `medium`, `high`) is the default reasoning effort of the node's model calls, and a model vertex's `config.reasoning` (`llm`, `router`, `verify`, `reduce` with mode `llm`) overrides it; the gateway maps it per model family, as for `caliban.reasoning`. `config.structured_output` is `json_schema` (the default: the vertex's `output_schema`, or a router's labels, go as `response_format` so vLLM, SGLang and OpenAI constrain decoding) or `prompt` (the schema in the prompt only, for servers without guided decoding). The answer is validated either way.
+
+**Guardrails.** `guardrails.answer` is the answer guard on the run's final output when it carries untrusted labels: `redact` (the default) removes links, contacts and references that only untrusted free text supplied, and echoes of injected instructions; `refuse` fails the run instead; `off` skips the check. `guardrails.pii` is a floor on the personal-data protection of the node's model calls on every model class, sovereign models included, and of untrusted tool arguments and results; it only strengthens the tenant's mode.
+
+```ts
+const triage = defineNode({
+  kind: 'workflow',
+  prompt: { system: 'Triage the case.' },
+  model_policy: { reasoning: 'low' },
+  guardrails: { answer: 'refuse', pii: 'mask' },
+  budgets: { steps: 10, tokens: 10_000, wall_clock_s: 60 },
+  graph: {
+    vertices: [
+      { id: 'route', type: 'router', config: { routes: { urgent: 'Needs care now', routine: 'Can wait' }, reasoning: 'off' } },
+      { id: 'advise', type: 'llm', config: { output_schema: { type: 'object' }, reasoning: 'high', structured_output: 'json_schema' } },
+    ],
+    edges: [{ from: 'route', to: 'advise' }],
+  },
+});
+```
+
 Mark the fields of `prompt.input_schema` that hold untrusted data (an email body, a web page) with `'x-caliban-untrusted': true` on the property, its `items` or the whole schema: whoever calls, their values make the run input carry the `caller` taint label, so a write their data reaches needs an `allow_tainted` entry or a human approval. A caller can mark more with `untrusted` on `runs.create()`, never less.
 
-A workflow (`kind: 'workflow'`) declares a `graph` of vertices and edges instead; `graph.entry` names the vertex a run starts at (default: the first). The helper types `NodePrompt`, `NodeTool`, `NodeToolRef`, `NodeModelPolicy`, `NodeGuardrails`, `NodeAgent`, `NodeBudgets`, `NodeGuards`, `NodeGraph`, `NodeVertex` and `NodeEdge` name the parts of a spec.
+A workflow (`kind: 'workflow'`) declares a `graph` of vertices and edges instead; `graph.entry` names the vertex a run starts at (default: the first). The helper types `NodePrompt`, `NodeTool`, `NodeToolRef`, `NodeModelPolicy`, `NodeGuardrails`, `NodeAgent`, `NodeBudgets`, `NodeGuards`, `NodeGraph`, `NodeVertex`, `NodeVertexConfig`, `NodeEdge`, `NodeReasoning`, `NodeStructuredOutput` and `NodeAnswerGuard` name the parts of a spec.
 
 Once created, a node is called from the data plane with `caliban: { node: 'invoice-triage' }`. The node design is described in [research note 04](https://github.com/thecalibanproject/docs/blob/main/research/04-agent-orchestration.md).
 
