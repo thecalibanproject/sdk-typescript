@@ -101,17 +101,8 @@ export type TenantIntents =
   paths['/api/v1/tenants/{tenantId}/intents']['get']['responses'][200]['content']['application/json'];
 /** One intent: its exemplars, `source` (`config`: the config file; `api`: set with `intents.put()`) and the node it hands to. */
 export type TenantIntent = NonNullable<TenantIntents['intents']>[number];
-/**
- * Result of `intents.put()`: the intent as stored. The contract declares no body for this
- * response; this is what core sends.
- */
-export interface TenantIntentSet {
-  tenant_id: string;
-  intent: string;
-  /** Trimmed, duplicates dropped. */
-  exemplars: string[];
-  source: 'api';
-}
+/** Result of `intents.put()`: the intent as stored (contract: `TenantIntentSet`); `exemplars` trimmed, duplicates dropped. */
+export type TenantIntentSet = Schemas['TenantIntentSet'];
 /** A catalogue model a collection can use (contract: `RagModel`). */
 export type RagModel = Schemas['RagModel'];
 /** Result of `rag.models()`: the embedding and rerank models the tenant can reach. */
@@ -548,7 +539,8 @@ export class CalibanAdmin {
      * Set the tenant's exemplars of an intent (`PUT`, `routes.write`; audited as `tenant.intent.set`
      * with counts, never the texts). At most 100 intents per tenant and 200 exemplars per intent,
      * each 1 to 2000 characters; an empty list removes a config-file intent for the tenant. The
-     * intent name is 1 to 64 characters of `[a-z0-9_.-]` (`pinned` is reserved).
+     * intent name is 1 to 64 characters of `[a-z0-9_.-]`; `pinned` is reserved (a 400), and an
+     * unknown tenant is a 404.
      */
     put: (tenantId: string, intent: string, exemplars: string[], opts?: AdminRequestOptions): Promise<TenantIntentSet> =>
       unwrap(
@@ -557,7 +549,7 @@ export class CalibanAdmin {
           params: { path: { tenantId, intent } },
           body: { exemplars },
         }),
-      ) as Promise<unknown> as Promise<TenantIntentSet>,
+      ),
     /** Drop the tenant's own exemplars of an intent; the config file's apply again (audited as `tenant.intent.delete`). */
     delete: async (tenantId: string, intent: string, opts?: AdminRequestOptions): Promise<void> => {
       await unwrap(

@@ -229,6 +229,8 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<RagModel['trust_tier']>().toEqualTypeOf<TrustTier>();
     expectTypeOf<IntrospectionJob['version']>().toEqualTypeOf<number | null>();
     expectTypeOf<TenantIntentSet['source']>().toExtend<NonNullable<TenantIntent['source']>>();
+    expectTypeOf<TenantIntentSet>().toEqualTypeOf<Schemas['TenantIntentSet']>();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/intents/{intent}']['put']['responses'][200]['content']['application/json']>().toEqualTypeOf<TenantIntentSet>();
   });
 
   it('rejects a misspelled extension key at compile time', () => {
