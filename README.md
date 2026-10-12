@@ -294,12 +294,15 @@ const ds = await admin.datasources.create({
   name: 'sales',
   connection: { uri: 'mongodb://mongo:27017', database: 'sales' },
 });
-await admin.datasources.introspect(ds.id); // starts a job, returns { job_id }
+await admin.datasources.introspect(ds.id); // starts a job: { job_id, job }
+const job = await admin.datasources.introspection(ds.id); // the newest job: status, proposed, skipped, version
 
 const ontology = await admin.ontology.get({ tenant_id: tenant.id });
-for (const el of ontology.elements.filter((e) => e.status === 'proposed')) {
-  await admin.ontology.review(el.id, { decision: 'approve', note: 'checked by data team' });
-}
+const proposed = ontology.elements.filter((e) => e.status === 'proposed');
+await admin.ontology.reviewBatch(tenant.id, {
+  decisions: proposed.map((e) => ({ id: e.id, decision: 'approve' as const })),
+  note: 'checked by data team',
+});
 
 const usage = await admin.usage.get({ tenant_id: tenant.id, limit: 50 });
 console.log(usage.totals.tokens_saved);
@@ -315,8 +318,9 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | `providerKeys` | `list`, `create`, `delete` (the server crypto-shreds the secret) |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
-| `datasources` | `list`, `create`, `delete`, `introspect` |
-| `ontology` | `get`, `review` |
+| `datasources` | `list`, `create`, `delete`, `introspect`, `introspection` |
+| `ontology` | `get`, `review`, `reviewBatch`, `propose` |
+| `intents` | `list`, `put`, `delete` (the tenant's `caliban/auto` exemplars) |
 | `nodes` | `list`, `create`, `delete` |
 | `goldenSets` | `get`, `put`, `delete` (per node version) |
 | `evalPolicy` | `get`, `put` (per node: the promotion bar) |
@@ -324,6 +328,7 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | `evalKey` | `get`, `rotate` (the tenant's eval key) |
 | `runs` | `list`, `get`, `input`, `cancel` (a tenant's node runs, as the console sees them) |
 | `inbox` | `list` (runs waiting for a human) |
+| `rag` | `models`, `collections.{list, create, get, delete}`, `documents.{list, ingest, get, delete, release}` |
 | `usage` | `get` |
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
@@ -381,6 +386,58 @@ console.log(`${totals.semantic_cache_hits ?? 0} of ${totals.cache_hits ?? 0} hit
 console.log(`auto margin: $${(totals.margin_usd ?? 0).toFixed(4)} over ${totals.auto_requests ?? 0} requests`);
 console.log(`${totals.auto_cache_hits ?? 0} auto cache hits saved customers $${(totals.auto_saved_usd ?? 0).toFixed(4)}`);
 ```
+
+#### Ontology bootstrap and review
+
+`datasources.introspect(datasourceId)` starts the ontology bootstrap and resolves to `{ job_id, job }`: the control plane connects with the datasource's credentials, checks that the principal is read only, samples every collection and writes its proposals (`status: 'proposed'`) in one ontology version. Elements a human already reviewed, and unchanged ones, are skipped. It is MongoDB only for now. `datasources.introspection(datasourceId)` returns the newest job (`running`, `succeeded` or `failed`, with `objects`, `proposed`, `skipped` and the ontology `version`); the control plane that ran it answers, and a datasource without a job throws a 404.
+
+```ts
+const decisions = [{ id: 'Service', decision: 'approve' as const }];
+await admin.ontology.propose(tenant.id, { elements: curatedElements }); // made outside Caliban: { version, proposed, skipped }
+const res = await admin.ontology.reviewBatch(tenant.id, { decisions, note: 'reviewed' }); // one new version
+await admin.ontology.review('Customer', { tenant_id: tenant.id, decision: 'deprecate' });
+```
+
+- Element ids are per tenant (two tenants may both have `Service`), so `ontology.review()` requires `tenant_id` in the body; the server answers `400` without it. Decisions are `approve`, `reject` or `deprecate`.
+- Withdrawing an approved element that a published node version's fixed CQIR query touches is a breaking change: a `409` naming the elements and node versions, unless you send `acknowledge_breaking: true` (those versions then fail on that query until a version written on the new ontology is published). `reviewBatch()` returns the `breaking` changes it acknowledged. Proposing over an approved element withdraws it the same way.
+- Every element carries `changed_in`, the ontology version its spec or status last changed in.
+
+#### Intents for `caliban/auto`
+
+A tenant's `caliban/auto` intents (the kNN exemplars routers classify with) come from the config file and from the admin API, which overrides the file intent by intent and needs no restart: routers rebuild their index with the next snapshot.
+
+```ts
+await admin.intents.put(tenant.id, 'triage', ['my chest hurts', 'I feel dizzy']); // { tenant_id, intent, exemplars, source: 'api' }
+await admin.tenants.update(tenant.id, { node_routes: { triage: 'node/triage' } }); // hand the intent to a node
+const { intents, removed } = await admin.intents.list(tenant.id); // each with source ('config' | 'api') and node
+await admin.intents.delete(tenant.id, 'triage'); // the config file's exemplars apply again
+```
+
+At most 100 intents per tenant and 200 exemplars per intent, each 1 to 2000 characters (duplicates are dropped). Intent names are 1 to 64 characters of `[a-z0-9_.-]`, and `pinned` is reserved. An empty list removes a config-file intent for the tenant (listed in `removed`). Changes are audited as `tenant.intent.set` and `tenant.intent.delete`, with counts and never the texts. `put()` is a `PUT`, retried like a GET.
+
+#### Document collections (RAG)
+
+Nodes search a collection with the `builtin://rag_search` tool, naming it in their scopes as `rag.<name>:read`. The control plane needs a document registry for these calls (else `503`).
+
+```ts
+const { embedding, rerank } = await admin.rag.models(tenant.id); // the models the tenant can reach
+await admin.rag.collections.create(tenant.id, { name: 'policies', embedding_model: embedding[0]!.id, rerank_model: rerank[0]?.id });
+await admin.rag.documents.ingest(tenant.id, 'policies', { doc_id: 'leave', content: markdown, trust: 'untrusted' });
+
+for (const c of await admin.rag.collections.list(tenant.id)) console.log(c.name, c.document_counts); // { ready: 12, quarantined: 1 }
+const { versions } = await admin.rag.documents.get(tenant.id, 'policies', 'leave');
+const v = versions[0]!;
+if (v.status === 'quarantined') {
+  console.log(v.findings.map((f) => `${f.kind} under ${f.heading_path?.join(' > ')}`));
+  await admin.rag.documents.release(tenant.id, 'policies', 'leave', { version: v.version, acknowledge_findings: true });
+}
+```
+
+- `rag.models()` lists the catalogue models of kind `embedding` and `rerank` that one of the tenant's providers, or a shared provider that serves it, can reach, each with its `trust_tier`.
+- `document_counts` (on the collection listing only) counts documents per status, using each document's newest version; deleted documents are not counted.
+- A version is `pending` and invisible until a worker has indexed it and its checks passed. An untrusted version whose checks have not passed by `vet_deadline_at` (the collection's `vet_deadline_secs` after ingest, or after its release) fails and stays invisible.
+- A finding's `heading_path` gives the headings above the chunk it was found in, so a reviewer can find the place in the source. It is pseudonymised like the indexed text and is never an excerpt of what triggered the finding.
+- Released text is still labelled `retrieved` in node runs: a tainted write it inspires needs an allowlist entry or a human approval.
 
 #### Node runs and the inbox
 

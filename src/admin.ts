@@ -39,9 +39,83 @@ export type DatasourceCreate = Schemas['DatasourceCreate'];
 export type Ontology = Schemas['Ontology'];
 export type OntologyElement = Schemas['OntologyElement'];
 export type OntologyElementKind = Schemas['OntologyElementKind'];
+/** Body of `ontology.review()`: `tenant_id` is required (element ids are per tenant). */
 export type OntologyReview = NonNullable<
   paths['/api/v1/ontology/elements/{elementId}/review']['post']['requestBody']
 >['content']['application/json'];
+/** `approve`, `reject` or `deprecate`. */
+export type OntologyDecision = OntologyReview['decision'];
+/** Body of `ontology.reviewBatch()`: one decision per element id, written as one ontology version. */
+export type OntologyBatchReview = NonNullable<
+  paths['/api/v1/tenants/{tenantId}/ontology/review']['post']['requestBody']
+>['content']['application/json'];
+/** Result of `ontology.reviewBatch()`: the new `version`, the reviewed `elements` and the `breaking` changes acknowledged. */
+export type OntologyBatchReviewResult =
+  paths['/api/v1/tenants/{tenantId}/ontology/review']['post']['responses'][200]['content']['application/json'];
+/** Body of `ontology.propose()`: elements made outside Caliban, written as `proposed` (1 to 5000). */
+export type OntologyProposals = NonNullable<
+  paths['/api/v1/tenants/{tenantId}/ontology/proposals']['post']['requestBody']
+>['content']['application/json'];
+/** Result of `ontology.propose()`: the ontology `version` and how many were `proposed` and `skipped` (unchanged). */
+export type OntologyProposalResult =
+  paths['/api/v1/tenants/{tenantId}/ontology/proposals']['post']['responses'][201]['content']['application/json'];
+/** An ontology bootstrap job of a datasource (contract: `IntrospectionJob`). */
+export type IntrospectionJob = Schemas['IntrospectionJob'];
+/** Result of `datasources.introspect()`: the job id and the job as it started. */
+export type IntrospectStarted =
+  paths['/api/v1/datasources/{datasourceId}/introspect']['post']['responses'][202]['content']['application/json'];
+/** Result of `intents.list()`: the tenant's `caliban/auto` intents as routers use them. */
+export type TenantIntents =
+  paths['/api/v1/tenants/{tenantId}/intents']['get']['responses'][200]['content']['application/json'];
+/** One intent: its exemplars, `source` (`config`: the config file; `api`: set with `intents.put()`) and the node it hands to. */
+export type TenantIntent = NonNullable<TenantIntents['intents']>[number];
+/**
+ * Result of `intents.put()`: the intent as stored. The contract declares no body for this
+ * response; this is what core sends.
+ */
+export interface TenantIntentSet {
+  tenant_id: string;
+  intent: string;
+  /** Trimmed, duplicates dropped. */
+  exemplars: string[];
+  source: 'api';
+}
+/** A catalogue model a collection can use (contract: `RagModel`). */
+export type RagModel = Schemas['RagModel'];
+/** Result of `rag.models()`: the embedding and rerank models the tenant can reach. */
+export type RagModels =
+  paths['/api/v1/tenants/{tenantId}/rag/models']['get']['responses'][200]['content']['application/json'];
+/** A document collection (contract: `RagCollection`); `document_counts` (per status) in the listing only. */
+export type RagCollection = Schemas['RagCollection'];
+export type RagCollectionCreate = Schemas['RagCollectionCreate'];
+export type RagCollectionSettings = Schemas['RagCollectionSettings'];
+/** Result of `rag.collections.get()`: the collection and the published versions that search it (`used_by`). */
+export type RagCollectionDetail =
+  paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}']['get']['responses'][200]['content']['application/json'];
+/** One version of a document (contract: `RagDocument`). Never the content. */
+export type RagDocument = Schemas['RagDocument'];
+/** `pending`, `indexing`, `ready`, `quarantined`, `failed`, `superseded` or `deleted`. Only `ready` is served. */
+export type RagDocumentStatus = Schemas['RagDocumentStatus'];
+/** Why a version was quarantined: `kind`, the `chunk`, and the `heading_path` above it (never an excerpt). */
+export type RagFinding = Schemas['RagFinding'];
+export type RagDocumentIngest = Schemas['RagDocumentIngest'];
+/** Result of `rag.documents.ingest()`: a new pending version, or the newest one with `unchanged: true`. */
+export type RagIngestResult =
+  | paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents']['post']['responses'][202]['content']['application/json']
+  | paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents']['post']['responses'][200]['content']['application/json'];
+/** Query of `rag.documents.list()`. */
+export type RagDocumentListQuery = NonNullable<
+  paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents']['get']['parameters']['query']
+>;
+/** A page of `rag.documents.list()`: each document's newest version with its `live_version`. */
+export type RagDocumentList =
+  paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents']['get']['responses'][200]['content']['application/json'];
+/** Result of `rag.documents.get()`: every version, newest first, and the one being served. */
+export type RagDocumentVersions =
+  paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}']['get']['responses'][200]['content']['application/json'];
+/** Body of `rag.documents.release()`. */
+export type RagRelease =
+  paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}/release']['post']['requestBody']['content']['application/json'];
 export type Node = Schemas['Node'];
 export type UsageReport = Schemas['UsageReport'];
 export type UsageEvent = Schemas['UsageEvent'];
@@ -363,21 +437,84 @@ export class CalibanAdmin {
         }),
       );
     },
-    /** Start an introspect/profile job that proposes ontology elements. Returns the job id. */
-    introspect: (datasourceId: string, opts?: AdminRequestOptions): Promise<{ job_id?: string }> =>
+    /**
+     * Start the ontology bootstrap (`202`): connect with the datasource's credentials, check the
+     * principal is read only, sample every collection and write proposals (`status: 'proposed'`) in
+     * one ontology version. Elements a human already reviewed, and unchanged ones, are skipped.
+     * MongoDB only. Resolves to the `job_id` and the `job`; follow it with `introspection()`.
+     */
+    introspect: (datasourceId: string, opts?: AdminRequestOptions): Promise<IntrospectStarted> =>
       unwrap(
         this.raw.POST('/api/v1/datasources/{datasourceId}/introspect', { ...opts, params: { path: { datasourceId } } }),
+      ),
+    /**
+     * The newest introspection job of the datasource (`running`, `succeeded` or `failed`, with the
+     * counts and the ontology `version` it wrote). Answered by the control plane that ran it; a 404
+     * `CalibanAPIError` when there is none.
+     */
+    introspection: (datasourceId: string, opts?: AdminRequestOptions): Promise<IntrospectionJob> =>
+      unwrap(
+        this.raw.GET('/api/v1/datasources/{datasourceId}/introspection', { ...opts, params: { path: { datasourceId } } }),
       ),
   };
 
   readonly ontology = {
     get: (query: { tenant_id?: string } = {}, opts?: AdminRequestOptions): Promise<Ontology> =>
       unwrap(this.raw.GET('/api/v1/ontology', { ...opts, params: { query } })),
-    /** Approve or reject a proposed ontology element. */
+    /**
+     * Approve, reject or deprecate one element of the tenant named in `body.tenant_id` (required:
+     * element ids are per tenant). Withdrawing an approved element a published node version's fixed
+     * query touches is a 409 `CalibanAPIError` unless `acknowledge_breaking: true`.
+     */
     review: (elementId: string, body: OntologyReview, opts?: AdminRequestOptions): Promise<OntologyElement> =>
       unwrap(
         this.raw.POST('/api/v1/ontology/elements/{elementId}/review', { ...opts, params: { path: { elementId } }, body }),
       ),
+    /**
+     * Review many of the tenant's elements as one new ontology version (`ontology.review`). A
+     * breaking change (see `review()`) is a 409 unless `acknowledge_breaking: true`; the result
+     * lists the `breaking` changes acknowledged.
+     */
+    reviewBatch: (tenantId: string, body: OntologyBatchReview, opts?: AdminRequestOptions): Promise<OntologyBatchReviewResult> =>
+      unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/ontology/review', { ...opts, params: { path: { tenantId } }, body })),
+    /**
+     * Propose elements made outside Caliban (an exported model, a curated file): written as
+     * `proposed` in one version for a human to review; unchanged elements are skipped. Proposing
+     * over an approved element withdraws it until it is approved again, a 409 when that breaks a
+     * published node version unless `acknowledge_breaking: true`.
+     */
+    propose: (tenantId: string, body: OntologyProposals, opts?: AdminRequestOptions): Promise<OntologyProposalResult> =>
+      unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/ontology/proposals', { ...opts, params: { path: { tenantId } }, body })),
+  };
+
+  /**
+   * The tenant's `caliban/auto` intents (kNN exemplars). Set here, they override the config
+   * file intent by intent; routers rebuild their index with the next snapshot, without a restart.
+   */
+  readonly intents = {
+    /** Every intent as routers use it, with its `source` and node; `removed`: file intents an empty list removes (`routes.read`). */
+    list: (tenantId: string, opts?: AdminRequestOptions): Promise<TenantIntents> =>
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/intents', { ...opts, params: { path: { tenantId } } })),
+    /**
+     * Set the tenant's exemplars of an intent (`PUT`, `routes.write`; audited as `tenant.intent.set`
+     * with counts, never the texts). At most 100 intents per tenant and 200 exemplars per intent,
+     * each 1 to 2000 characters; an empty list removes a config-file intent for the tenant. The
+     * intent name is 1 to 64 characters of `[a-z0-9_.-]` (`pinned` is reserved).
+     */
+    put: (tenantId: string, intent: string, exemplars: string[], opts?: AdminRequestOptions): Promise<TenantIntentSet> =>
+      unwrap(
+        this.raw.PUT('/api/v1/tenants/{tenantId}/intents/{intent}', {
+          ...opts,
+          params: { path: { tenantId, intent } },
+          body: { exemplars },
+        }),
+      ) as Promise<unknown> as Promise<TenantIntentSet>,
+    /** Drop the tenant's own exemplars of an intent; the config file's apply again (audited as `tenant.intent.delete`). */
+    delete: async (tenantId: string, intent: string, opts?: AdminRequestOptions): Promise<void> => {
+      await unwrap(
+        this.raw.DELETE('/api/v1/tenants/{tenantId}/intents/{intent}', { ...opts, params: { path: { tenantId, intent } } }),
+      );
+    },
   };
 
   readonly nodes = {
@@ -560,6 +697,105 @@ export class CalibanAdmin {
     /** Oldest wait first (`runs.read`; questions and approval `arguments` with `runs.data`). */
     list: (tenantId: string, opts?: AdminRequestOptions): Promise<Inbox> =>
       unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/inbox', { ...opts, params: { path: { tenantId } } })),
+  };
+
+  /**
+   * Document collections nodes search with `builtin://rag_search` (scope `rag.<name>:read`). Needs
+   * a document registry on the control plane, else 503.
+   */
+  readonly rag = {
+    /** The embedding and rerank models the tenant can reach, to pick a collection's models from (`rag.read`). */
+    models: (tenantId: string, opts?: AdminRequestOptions): Promise<RagModels> =>
+      unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/rag/models', { ...opts, params: { path: { tenantId } } })),
+    collections: {
+      /** The tenant's collections, each with `document_counts` per status. */
+      list: (tenantId: string, opts?: AdminRequestOptions): Promise<RagCollection[]> =>
+        unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/rag/collections', { ...opts, params: { path: { tenantId } } })),
+      /** Create a collection; `embedding_model` is fixed for its life. Audited as `rag.collection.create`. */
+      create: (tenantId: string, body: RagCollectionCreate, opts?: AdminRequestOptions): Promise<RagCollection> =>
+        unwrap(this.raw.POST('/api/v1/tenants/{tenantId}/rag/collections', { ...opts, params: { path: { tenantId } }, body })),
+      /** A collection with `used_by`: the published node versions that search it. */
+      get: (tenantId: string, collection: string, opts?: AdminRequestOptions): Promise<RagCollectionDetail> =>
+        unwrap(
+          this.raw.GET('/api/v1/tenants/{tenantId}/rag/collections/{collection}', {
+            ...opts,
+            params: { path: { tenantId, collection } },
+          }),
+        ),
+      /** Delete a collection and its documents. A 409 `CalibanAPIError` while a published node version names it. */
+      delete: async (tenantId: string, collection: string, opts?: AdminRequestOptions): Promise<void> => {
+        await unwrap(
+          this.raw.DELETE('/api/v1/tenants/{tenantId}/rag/collections/{collection}', {
+            ...opts,
+            params: { path: { tenantId, collection } },
+          }),
+        );
+      },
+    },
+    documents: {
+      /** One page of documents (newest version of each, with `live_version`); follow `next_cursor`. Never the content. */
+      list: (
+        tenantId: string,
+        collection: string,
+        query: RagDocumentListQuery = {},
+        opts?: AdminRequestOptions,
+      ): Promise<RagDocumentList> =>
+        unwrap(
+          this.raw.GET('/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents', {
+            ...opts,
+            params: { path: { tenantId, collection }, query },
+          }),
+        ),
+      /**
+       * Ingest a version of `doc_id` (`202`, `pending` and invisible until indexed and vetted; an
+       * untrusted one fails at `vet_deadline_at` if its checks have not passed). The same content
+       * again resolves to the newest version with `unchanged: true`. Retried on 429/503 only.
+       */
+      ingest: (tenantId: string, collection: string, body: RagDocumentIngest, opts?: AdminRequestOptions): Promise<RagIngestResult> =>
+        unwrap(
+          this.raw.POST('/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents', {
+            ...opts,
+            params: { path: { tenantId, collection } },
+            body,
+          }),
+        ),
+      /** Every version of a document, newest first, with its status, `findings` and `vet_deadline_at`. */
+      get: (tenantId: string, collection: string, docId: string, opts?: AdminRequestOptions): Promise<RagDocumentVersions> =>
+        unwrap(
+          this.raw.GET('/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}', {
+            ...opts,
+            params: { path: { tenantId, collection, docId } },
+          }),
+        ),
+      /** Delete every version; it stops being served at once and its sealed content is wiped. */
+      delete: async (tenantId: string, collection: string, docId: string, opts?: AdminRequestOptions): Promise<void> => {
+        await unwrap(
+          this.raw.DELETE('/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}', {
+            ...opts,
+            params: { path: { tenantId, collection, docId } },
+          }),
+        );
+      },
+      /**
+       * Release a quarantined version (`rag.approve`): a decision about its findings, so
+       * `acknowledge_findings` must be `true`. It goes back to `pending` and is indexed again;
+       * its text stays labelled `retrieved` in node runs.
+       */
+      release: (
+        tenantId: string,
+        collection: string,
+        docId: string,
+        body: RagRelease,
+        opts?: AdminRequestOptions,
+      ): Promise<RagDocument> =>
+        unwrap(
+          this.raw.POST('/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}/release', {
+            ...opts,
+            params: { path: { tenantId, collection, docId } },
+            body,
+          }),
+        ),
+    },
   };
 
   readonly usage = {

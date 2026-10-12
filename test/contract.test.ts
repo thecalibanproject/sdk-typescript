@@ -10,13 +10,17 @@ import type {
   CreateEmbeddingResponse,
   EmbeddingCreateParams,
   IntentDecision,
+  IntrospectionJob,
   ModelCalibanInfo,
   ModelCreate,
   ModelDiscovery,
   ModelInfo,
   ModelList,
+  OntologyDecision,
+  OntologyReview,
   PiiSurrogateScope,
   ProviderHealth,
+  RagModel,
   ReasoningEffort,
   RegistryModel,
   RerankCreateParams,
@@ -27,6 +31,8 @@ import type {
   SharedProvider,
   SharedProviderCreate,
   Tenant,
+  TenantIntent,
+  TenantIntentSet,
   TenantListOptions,
   TenantUpdate,
   TrustTier,
@@ -204,6 +210,23 @@ describe('contract alignment (type-level)', () => {
       | 'routed_model_cost_usd'
       | 'margin_usd'
     >();
+  });
+
+  it('the ontology, intent and RAG endpoints the helpers call exist in the contract', () => {
+    expectTypeOf<paths['/api/v1/datasources/{datasourceId}/introspection']['get']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/ontology/proposals']['post']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/ontology/review']['post']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/intents']['get']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/intents/{intent}']['put']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/intents/{intent}']['delete']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/rag/models']['get']>().not.toBeNever();
+    expectTypeOf<paths['/api/v1/tenants/{tenantId}/rag/collections/{collection}/documents/{docId}/release']['post']>().not.toBeNever();
+    // The single-element review names the tenant; decisions include deprecate.
+    expectTypeOf<OntologyReview['tenant_id']>().toEqualTypeOf<string>();
+    expectTypeOf<OntologyDecision>().toEqualTypeOf<'approve' | 'reject' | 'deprecate'>();
+    expectTypeOf<RagModel['trust_tier']>().toEqualTypeOf<TrustTier>();
+    expectTypeOf<IntrospectionJob['version']>().toEqualTypeOf<number | null | undefined>();
+    expectTypeOf<TenantIntentSet['source']>().toExtend<NonNullable<TenantIntent['source']>>();
   });
 
   it('rejects a misspelled extension key at compile time', () => {

@@ -17,6 +17,7 @@ import {
   type GoldenSummary,
   type GoldenVerdict,
   type InjectionVerdict,
+  type OntologyElement,
   type Problem,
 } from '../src/index.js';
 import { fastRetry, json, mockFetch } from './helpers.js';
@@ -599,5 +600,204 @@ describe('CalibanAdmin console runs and inbox', () => {
     const inbox = await admin(m.fetch).inbox.list('t_1');
     expect(inbox.data[0]?.approval?.labels).toEqual(['caller']);
     expect(m.calls[0]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/tenants/t_1/inbox' });
+  });
+});
+
+describe('CalibanAdmin: ontology bootstrap, intents and document collections', () => {
+  const T = 'http://cp:8081/api/v1/tenants/t_1';
+  const job = {
+    id: 'ij_1',
+    datasource_id: 'ds1',
+    tenant_id: 't_1',
+    status: 'succeeded',
+    objects: 4,
+    proposed: 9,
+    skipped: 2,
+    version: 7,
+    started_at: '2026-10-11T09:00:00Z',
+    finished_at: '2026-10-11T09:00:03Z',
+  };
+  const element: OntologyElement = { id: 'Service', kind: 'entity', name: 'Service', status: 'proposed', provenance: 'human', changed_in: 7 };
+
+  it('starts introspection and reads the newest job back', async () => {
+    const m = mockFetch(json({ job_id: 'ij_1', job: { ...job, status: 'running', version: null } }, { status: 202 }), json(job));
+    const a = admin(m.fetch);
+    const started = await a.datasources.introspect('ds1');
+    expect(started.job?.status).toBe('running');
+    const done = await a.datasources.introspection('ds/1');
+    expect(m.calls[1]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/datasources/ds%2F1/introspection' });
+    expect([done.status, done.proposed, done.skipped, done.version]).toEqual(['succeeded', 9, 2, 7]);
+    expectTypeOf(done.status).toEqualTypeOf<'running' | 'succeeded' | 'failed' | undefined>();
+  });
+
+  it('proposes elements and reviews a batch as one version', async () => {
+    const m = mockFetch(
+      json({ tenant_id: 't_1', version: 8, proposed: 1, skipped: 0 }, { status: 201 }),
+      json({ tenant_id: 't_1', version: 9, elements: [{ ...element, status: 'approved' }], breaking: [] }),
+      json({ error: { message: 'breaks invoice-triage@v3', type: 'conflict', code: null } }, { status: 409 }),
+    );
+    const a = admin(m.fetch);
+    const res = await a.ontology.propose('t_1', { elements: [element] });
+    expect(m.calls[0]).toMatchObject({ method: 'POST', url: `${T}/ontology/proposals` });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ elements: [element] });
+    expect([res.version, res.proposed, res.skipped]).toEqual([8, 1, 0]);
+
+    const batch = await a.ontology.reviewBatch('t_1', { decisions: [{ id: 'Service', decision: 'approve' }], note: 'checked' });
+    expect(m.calls[1]).toMatchObject({ method: 'POST', url: `${T}/ontology/review` });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ decisions: [{ id: 'Service', decision: 'approve' }], note: 'checked' });
+    expect(batch.version).toBe(9);
+
+    const err = await a.ontology
+      .reviewBatch('t_1', { decisions: [{ id: 'Service', decision: 'deprecate' }] })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 409, type: 'conflict' });
+    // A POST is not retried on 409.
+    expect(m.calls).toHaveLength(3);
+  });
+
+  it('requires the tenant on the single-element review at compile time', async () => {
+    const m = mockFetch(json({ ...element, status: 'deprecated' }));
+    const a = admin(m.fetch);
+    // @ts-expect-error tenant_id is required: element ids are per tenant
+    const noTenant: Parameters<typeof a.ontology.review>[1] = { decision: 'approve' };
+    expect(noTenant).toBeDefined();
+    const el = await a.ontology.review('Service', { tenant_id: 't_1', decision: 'deprecate', acknowledge_breaking: true });
+    expect(el.status).toBe('deprecated');
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ tenant_id: 't_1', decision: 'deprecate', acknowledge_breaking: true });
+  });
+
+  it('lists, sets and drops the tenant intents', async () => {
+    const intents = {
+      tenant_id: 't_1',
+      intents: [
+        { intent: 'triage', exemplars: ['my chest hurts'], source: 'api', node: 'node/triage' },
+        { intent: 'billing', exemplars: ['refund my invoice'], source: 'config', node: null },
+      ],
+      removed: ['smalltalk'],
+    };
+    const m = mockFetch(
+      json(intents),
+      json({ tenant_id: 't_1', intent: 'triage', exemplars: ['my chest hurts', 'I feel dizzy'], source: 'api' }),
+      new Response(null, { status: 204 }),
+    );
+    const a = admin(m.fetch);
+    const list = await a.intents.list('t_1');
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${T}/intents` });
+    expect(list.intents?.map((i) => [i.intent, i.source, i.node])).toEqual([
+      ['triage', 'api', 'node/triage'],
+      ['billing', 'config', null],
+    ]);
+    expect(list.removed).toEqual(['smalltalk']);
+
+    const set = await a.intents.put('t_1', 'triage', ['my chest hurts', 'I feel dizzy']);
+    expect(m.calls[1]).toMatchObject({ method: 'PUT', url: `${T}/intents/triage` });
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ exemplars: ['my chest hurts', 'I feel dizzy'] });
+    expect(set).toEqual({ tenant_id: 't_1', intent: 'triage', exemplars: ['my chest hurts', 'I feel dizzy'], source: 'api' });
+
+    await expect(a.intents.delete('t_1', 'triage')).resolves.toBeUndefined();
+    expect(m.calls[2]).toMatchObject({ method: 'DELETE', url: `${T}/intents/triage`, body: null });
+  });
+
+  it('retries the intent PUT on 502 like a GET', async () => {
+    const m = mockFetch(new Response('', { status: 502 }), json({ tenant_id: 't_1', intent: 'x', exemplars: [], source: 'api' }));
+    await admin(m.fetch).intents.put('t_1', 'x', []);
+    expect(m.calls.map((c) => c.method)).toEqual(['PUT', 'PUT']);
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ exemplars: [] });
+  });
+
+  it('lists the RAG models and collections with document counts', async () => {
+    const collection = {
+      id: 'rc_1',
+      tenant_id: 't_1',
+      name: 'policies',
+      embedding_model: 'local/bge-m3',
+      settings: { default_trust: 'untrusted', vet_deadline_secs: 900 },
+      created_at: 'x',
+      created_by: 'admin',
+      document_counts: { ready: 12, pending: 1, quarantined: 2 },
+    };
+    const m = mockFetch(
+      json({
+        embedding: [{ id: 'local/bge-m3', provider: 'gpu-pool', trust_tier: 't0_sovereign' }],
+        rerank: [{ id: 'local/qwen3-reranker', provider: 'gpu-pool', trust_tier: 't0_sovereign' }],
+      }),
+      json([collection]),
+      json({ ...collection, document_counts: undefined, used_by: ['desk@v2'] }),
+      json(collection, { status: 201 }),
+      new Response(null, { status: 204 }),
+    );
+    const a = admin(m.fetch);
+    const models = await a.rag.models('t_1');
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: `${T}/rag/models` });
+    expect(models.embedding.map((x) => x.id)).toEqual(['local/bge-m3']);
+    expect(models.rerank[0]?.trust_tier).toBe('t0_sovereign');
+
+    const [c] = await a.rag.collections.list('t_1');
+    expect(c?.document_counts).toEqual({ ready: 12, pending: 1, quarantined: 2 });
+    expectTypeOf(c!.document_counts).toEqualTypeOf<Record<string, number> | undefined>();
+    const detail = await a.rag.collections.get('t_1', 'policies');
+    expect(detail.used_by).toEqual(['desk@v2']);
+    await a.rag.collections.create('t_1', { name: 'policies', embedding_model: 'local/bge-m3', rerank_model: 'local/qwen3-reranker' });
+    expect(JSON.parse(m.calls[3]!.body!)).toEqual({ name: 'policies', embedding_model: 'local/bge-m3', rerank_model: 'local/qwen3-reranker' });
+    await a.rag.collections.delete('t_1', 'policies');
+    expect(m.calls.map((x) => [x.method, x.url]).slice(1)).toEqual([
+      ['GET', `${T}/rag/collections`],
+      ['GET', `${T}/rag/collections/policies`],
+      ['POST', `${T}/rag/collections`],
+      ['DELETE', `${T}/rag/collections/policies`],
+    ]);
+  });
+
+  it('ingests, lists, reads and releases documents', async () => {
+    const doc = {
+      tenant_id: 't_1',
+      collection_id: 'rc_1',
+      doc_id: 'leave-policy',
+      version: 2,
+      content_type: 'text/markdown',
+      trust: 'untrusted',
+      bytes: 2048,
+      status: 'quarantined',
+      chunks: 6,
+      tokens: 1500,
+      pii_entities: 3,
+      findings: [{ kind: 'instruction', chunk: 4, heading_path: ['Leave policy', 'Exceptions'] }],
+      findings_acknowledged: false,
+      attempts: 1,
+      created_at: '2026-10-11T09:00:00Z',
+      created_by: 'admin',
+      vet_deadline_at: '2026-10-11T09:15:00Z',
+    };
+    const D = `${T}/rag/collections/policies/documents`;
+    const m = mockFetch(
+      json({ ...doc, status: 'pending', findings: [], unchanged: false }, { status: 202 }),
+      json({ documents: [{ ...doc, live_version: 1 }], next_cursor: 'c2' }),
+      json({ doc_id: 'leave-policy', live_version: 1, versions: [doc] }),
+      json({ ...doc, status: 'pending', findings_acknowledged: true, released_by: 'admin', vet_deadline_at: '2026-10-11T10:15:00Z' }),
+      new Response(null, { status: 204 }),
+    );
+    const a = admin(m.fetch);
+    const ingested = await a.rag.documents.ingest('t_1', 'policies', { doc_id: 'leave-policy', content: '# Leave policy', trust: 'untrusted' });
+    expect(ingested.unchanged).toBe(false);
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ doc_id: 'leave-policy', content: '# Leave policy', trust: 'untrusted' });
+
+    const page = await a.rag.documents.list('t_1', 'policies', { status: 'quarantined', limit: 10 });
+    expect(m.calls[1]!.url).toBe(`${D}?status=quarantined&limit=10`);
+    expect(page.documents[0]?.live_version).toBe(1);
+    expect(page.next_cursor).toBe('c2');
+
+    const versions = await a.rag.documents.get('t_1', 'policies', 'leave-policy');
+    const v = versions.versions[0]!;
+    expect(v.vet_deadline_at).toBe('2026-10-11T09:15:00Z');
+    expect(v.findings[0]?.heading_path).toEqual(['Leave policy', 'Exceptions']);
+    expectTypeOf(v.findings[0]!.heading_path).toEqualTypeOf<string[] | undefined>();
+
+    const released = await a.rag.documents.release('t_1', 'policies', 'leave-policy', { version: 2, acknowledge_findings: true });
+    expect(m.calls[3]).toMatchObject({ method: 'POST', url: `${D}/leave-policy/release` });
+    expect(JSON.parse(m.calls[3]!.body!)).toEqual({ version: 2, acknowledge_findings: true });
+    expect(released.vet_deadline_at).toBe('2026-10-11T10:15:00Z');
+
+    await a.rag.documents.delete('t_1', 'policies', 'leave-policy');
+    expect(m.calls[4]).toMatchObject({ method: 'DELETE', url: `${D}/leave-policy` });
   });
 });
