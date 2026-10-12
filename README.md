@@ -119,9 +119,16 @@ The gateway reports what it did in `x-caliban-*` response headers. The SDK parse
 | `x-caliban-cache-tier` | `cacheTier` | `'exact'` or `'semantic'`, sent on hits only. `undefined` otherwise. |
 | `x-caliban-intent` | `intent` | The routing decision, parsed into `{ intent, confidence, stage, knnReason? }`. `undefined` when absent or malformed. |
 | `x-caliban-pii-entities` | `piiEntities` | Number of PII entities detected and protected. |
-| `x-caliban-cost-usd` | `costUsd` | Non-streaming responses only; `null` when the model has no price. |
+| `x-caliban-cost-usd` | `costUsd` | Non-streaming responses only; `null` when the model has no price. For a node answer, the routed models' real cost (the run's `model_cost_usd`). |
+| `x-caliban-billed-usd` | `billedUsd` | Non-streaming node answers: what the run is billed (its `cost_usd`). `undefined` otherwise. |
+| `x-caliban-route` | `route` | `node/<name>@v<N>` when a node answered, `model:<id>` when `caliban/auto` answered with a model for a tenant that maps intents to nodes. |
+| `x-caliban-route-fallback` | `routeFallback` | Why `caliban/auto` answered with a model rather than a node (`low_confidence`, `no_node_for_intent`, ...). |
+| `Caliban-Run-Id` | `runId` | The node run that answered. |
+| `x-caliban-run-status` | `runStatus` | Its status, for example `succeeded` or `input_required`. |
 
-`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_CACHE_TIER`, `HEADER_INTENT`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`), and `parseResponseMeta(response)` works on any `Response`.
+`meta.status` holds the HTTP status and `meta.headers` the full `Headers` object. The header names are exported as constants (`HEADER_REQUEST_ID`, `HEADER_ROUTED_MODEL`, `HEADER_CACHE`, `HEADER_CACHE_TIER`, `HEADER_INTENT`, `HEADER_PII_ENTITIES`, `HEADER_COST_USD`, `HEADER_BILLED_USD`, `HEADER_ROUTE`, `HEADER_ROUTE_FALLBACK`, `HEADER_RUN_ID`, `HEADER_RUN_STATUS`), and `parseResponseMeta(response)` works on any `Response`. The last five are only set when the gateway sends them.
+
+A node answer (`model: 'node/<name>'`, or `caliban/auto` handing the request to a node) carries the headers of every chat response: `requestId`, `routedModel` (`node/<name>@v<N>`), `cache: 'bypass'`, and on non-streaming answers `piiEntities` (the entities protected across the run's model calls), `costUsd` and `billedUsd`.
 
 The gateway sends `x-caliban-intent` as `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` when kNN routing was on but did not decide (`timeout`, `embed_error`, `unavailable`, `no_text`, `abstain_oos`, `abstain_confidence`, `abstain_margin`, `abstain_empty`). A request for a named model reports `pinned;confidence=1.000;stage=rules`.
 

@@ -51,6 +51,10 @@ export {
   HEADER_INTENT,
   HEADER_PII_ENTITIES,
   HEADER_COST_USD,
+  HEADER_BILLED_USD,
+  HEADER_ROUTE,
+  HEADER_ROUTE_FALLBACK,
+  HEADER_RUN_STATUS,
 } from './meta.js';
 export type * from './types.js';
 export type { paths, components } from './generated/schema.js';

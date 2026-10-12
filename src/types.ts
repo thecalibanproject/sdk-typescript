@@ -273,6 +273,19 @@ export interface CalibanResponseMeta {
    * when the model has no price (streams report cost in usage events instead).
    */
   costUsd: number | null;
+  /**
+   * `x-caliban-billed-usd`: what a node answer is billed (the run's `cost_usd`), next to
+   * `costUsd`, the routed models' real cost (its `model_cost_usd`). Non-streaming node answers only.
+   */
+  billedUsd?: number;
+  /** `x-caliban-route`: `node/<name>@v<N>` when a node answered, `model:<id>` for a `caliban/auto` model answer. */
+  route?: string;
+  /** `x-caliban-route-fallback`: why `caliban/auto` answered with a model rather than a node. */
+  routeFallback?: string;
+  /** `Caliban-Run-Id`: the node run that answered. */
+  runId?: string;
+  /** `x-caliban-run-status`: the status of that run (`succeeded`, `input_required`, ...). */
+  runStatus?: string;
   /** HTTP status of the response. */
   status: number;
   /** All response headers. */

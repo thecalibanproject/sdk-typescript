@@ -7,6 +7,12 @@ export const HEADER_CACHE_TIER = 'x-caliban-cache-tier';
 export const HEADER_INTENT = 'x-caliban-intent';
 export const HEADER_PII_ENTITIES = 'x-caliban-pii-entities';
 export const HEADER_COST_USD = 'x-caliban-cost-usd';
+export const HEADER_BILLED_USD = 'x-caliban-billed-usd';
+export const HEADER_ROUTE = 'x-caliban-route';
+export const HEADER_ROUTE_FALLBACK = 'x-caliban-route-fallback';
+export const HEADER_RUN_STATUS = 'x-caliban-run-status';
+/** Response header naming the run a response is about (run creation, event streams, node answers). */
+export const HEADER_RUN_ID = 'caliban-run-id';
 
 const CACHE_TIERS: ReadonlySet<string> = new Set<CacheTier>(['exact', 'semantic']);
 const ROUTE_STAGES: ReadonlySet<string> = new Set<RouteStage>(['rules', 'knn', 'keyword']);
@@ -64,8 +70,7 @@ export function parseResponseMeta(response: Pick<Response, 'headers' | 'status'>
   const cache = nonEmpty(h.get(HEADER_CACHE));
   const piiRaw = nonEmpty(h.get(HEADER_PII_ENTITIES));
   const pii = piiRaw !== null && /^\d+$/.test(piiRaw) ? Number(piiRaw) : null;
-  const costRaw = nonEmpty(h.get(HEADER_COST_USD));
-  const cost = costRaw !== null && /^\d+(\.\d+)?([eE][-+]?\d+)?$/.test(costRaw) ? Number(costRaw) : null;
+  const cost = parseUsd(h.get(HEADER_COST_USD));
   const meta: CalibanResponseMeta = {
     requestId: nonEmpty(h.get(HEADER_REQUEST_ID)),
     routedModel: nonEmpty(h.get(HEADER_ROUTED_MODEL)),
@@ -79,7 +84,23 @@ export function parseResponseMeta(response: Pick<Response, 'headers' | 'status'>
   if (cacheTier !== undefined) meta.cacheTier = cacheTier;
   const intent = parseIntentHeader(h.get(HEADER_INTENT));
   if (intent !== undefined) meta.intent = intent;
+  const billed = parseUsd(h.get(HEADER_BILLED_USD));
+  if (billed !== null) meta.billedUsd = billed;
+  const route = nonEmpty(h.get(HEADER_ROUTE));
+  if (route !== null) meta.route = route;
+  const fallback = nonEmpty(h.get(HEADER_ROUTE_FALLBACK));
+  if (fallback !== null) meta.routeFallback = fallback;
+  const runId = nonEmpty(h.get(HEADER_RUN_ID));
+  if (runId !== null) meta.runId = runId;
+  const runStatus = nonEmpty(h.get(HEADER_RUN_STATUS));
+  if (runStatus !== null) meta.runStatus = runStatus;
   return meta;
+}
+
+/** A non-negative decimal USD amount, or `null` when absent or malformed. */
+function parseUsd(value: string | null): number | null {
+  const raw = nonEmpty(value);
+  return raw !== null && /^\d+(\.\d+)?([eE][-+]?\d+)?$/.test(raw) ? Number(raw) : null;
 }
 
 /** Attach `meta` as a non-enumerable property so `JSON.stringify` keeps the OpenAI shape. */

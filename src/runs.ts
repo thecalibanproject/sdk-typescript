@@ -1,7 +1,7 @@
 import type { CalibanClient } from './client.js';
 import { CalibanError, CalibanStreamError } from './errors.js';
 import type { RequestLifetime } from './internal/http.js';
-import { parseResponseMeta } from './meta.js';
+import { HEADER_RUN_ID, parseResponseMeta } from './meta.js';
 import { iterSSEEvents } from './sse.js';
 import type {
   CalibanResponseMeta,
@@ -18,8 +18,7 @@ import type {
   WithMeta,
 } from './types.js';
 
-/** Response header naming the run a response is about (run creation and event streams). */
-export const HEADER_RUN_ID = 'caliban-run-id';
+export { HEADER_RUN_ID };
 
 /** Event types after which a run's event stream ends. */
 const TERMINAL_EVENTS: ReadonlySet<string> = new Set(['run.finished', 'run.input_required']);

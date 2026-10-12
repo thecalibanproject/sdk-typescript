@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   CalibanClient,
+  HEADER_BILLED_USD,
   HEADER_CACHE_TIER,
+  HEADER_COST_USD,
   HEADER_INTENT,
+  HEADER_PII_ENTITIES,
+  HEADER_REQUEST_ID,
+  HEADER_ROUTE,
+  HEADER_ROUTE_FALLBACK,
+  HEADER_ROUTED_MODEL,
+  HEADER_RUN_ID,
+  HEADER_RUN_STATUS,
   parseCacheTier,
   parseIntentHeader,
   parseResponseMeta,
@@ -137,5 +146,51 @@ describe('parseResponseMeta with routing and cache-tier headers', () => {
     const stream = await c.chat.completions.create({ model: 'caliban/auto', messages: msgs, stream: true });
     expect(stream.meta.cacheTier).toBe('exact');
     expect(stream.meta.intent?.stage).toBe('keyword');
+  });
+});
+
+describe('parseResponseMeta on node answers', () => {
+  const nodeAnswer = {
+    [HEADER_REQUEST_ID]: 'req_7',
+    [HEADER_ROUTED_MODEL]: 'node/triage@v3',
+    'x-caliban-cache': 'bypass',
+    [HEADER_PII_ENTITIES]: '2',
+    [HEADER_COST_USD]: '0.0011',
+    [HEADER_BILLED_USD]: '0.004',
+    [HEADER_ROUTE]: 'node/triage@v3',
+    [HEADER_RUN_ID]: 'run_9',
+    [HEADER_RUN_STATUS]: 'succeeded',
+  };
+
+  it('reads the request id, routed model, PII count, real and billed cost, route and run', () => {
+    expect(meta(nodeAnswer)).toMatchObject({
+      requestId: 'req_7',
+      routedModel: 'node/triage@v3',
+      cache: 'bypass',
+      piiEntities: 2,
+      costUsd: 0.0011,
+      billedUsd: 0.004,
+      route: 'node/triage@v3',
+      runId: 'run_9',
+      runStatus: 'succeeded',
+    });
+  });
+
+  it('reports a caliban/auto fallback to a model', () => {
+    const m = meta({ [HEADER_ROUTE]: 'model:local/qwen3-8b', [HEADER_ROUTE_FALLBACK]: 'low_confidence' });
+    expect([m.route, m.routeFallback, m.runId]).toEqual(['model:local/qwen3-8b', 'low_confidence', undefined]);
+  });
+
+  it('leaves the node fields out when absent, blank or malformed', () => {
+    const m = meta({ [HEADER_BILLED_USD]: 'free', [HEADER_ROUTE]: '  ', [HEADER_RUN_ID]: '' });
+    for (const k of ['billedUsd', 'route', 'routeFallback', 'runId', 'runStatus']) expect(k in m).toBe(false);
+    expect(meta({ [HEADER_BILLED_USD]: '-1' }).billedUsd).toBeUndefined();
+  });
+
+  it('is exposed on a chat completion a node answered', async () => {
+    const m = mockFetch(json(completion, { headers: nodeAnswer }));
+    const res = await client(m.fetch).chat.completions.create({ model: 'node/triage', messages: msgs });
+    expect(res.meta).toMatchObject({ requestId: 'req_7', routedModel: 'node/triage@v3', piiEntities: 2, costUsd: 0.0011, runId: 'run_9' });
+    expect(JSON.parse(JSON.stringify(res))).toEqual(completion);
   });
 });
