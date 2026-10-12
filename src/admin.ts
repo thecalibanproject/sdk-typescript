@@ -228,7 +228,11 @@ export type EvalKeyRotation =
 
 // ── Node runs and the inbox (console) ──
 
-/** A run as the console sees it (contract: `ConsoleRun`): content (`input`, `output`, step outputs) only with `runs.data`. */
+/**
+ * A run as the console sees it (contract: `ConsoleRun`): content (`input`, `output`, step outputs)
+ * only with `runs.data`. `cost_usd` is what the run is billed and `model_cost_usd` the real cost of
+ * the models its calls were routed to; `answer_check` (`AnswerCheck`, metadata only) with `runs.read`.
+ */
 export type ConsoleRun = Schemas['ConsoleRun'];
 /** Query of `runs.list()` (admin). `status` is comma separated; times are RFC 3339. */
 export type ConsoleRunListQuery = NonNullable<paths['/api/v1/tenants/{tenantId}/runs']['get']['parameters']['query']>;
@@ -718,7 +722,10 @@ export class CalibanAdmin {
     /** One page, newest first (`runs.read`). Pass `next_cursor` as `cursor` for the next. */
     list: (tenantId: string, query: ConsoleRunListQuery = {}, opts?: AdminRequestOptions): Promise<ConsoleRunList> =>
       unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/runs', { ...opts, params: { path: { tenantId }, query } })),
-    /** Status, budget, cost, usage and steps (`runs.read`); content too with `runs.data` (`content_visible`). */
+    /**
+     * Status, budget, cost (`cost_usd` billed, `model_cost_usd` the routed models' real cost), usage,
+     * the answer guard's `answer_check` and steps (`runs.read`); content too with `runs.data` (`content_visible`).
+     */
     get: (tenantId: string, runId: string, opts?: AdminRequestOptions): Promise<ConsoleRun> =>
       unwrap(this.raw.GET('/api/v1/tenants/{tenantId}/runs/{runId}', { ...opts, params: { path: { tenantId, runId } } })),
     /**

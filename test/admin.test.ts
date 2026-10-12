@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
+  type AnswerCheck,
   CalibanAdmin,
   CalibanAPIError,
   CalibanConnectionError,
@@ -7,6 +8,7 @@ import {
   defineNode,
   isOntologyBreakingError,
   ONTOLOGY_BREAKING_CHANGE,
+  type ConsoleRun,
   type Eval,
   type EvalCheck,
   type EvalGate,
@@ -27,7 +29,9 @@ import {
   type OntologyProposalResult,
   type PiiPattern,
   type PiiTerm,
+  type NodeRun,
   type Problem,
+  type RunAnswerCheck,
   type Tenant,
   type UsageByPurpose,
   type UsagePurpose,
@@ -675,6 +679,29 @@ describe('CalibanAdmin console runs and inbox', () => {
     expect((await a.runs.cancel('t_1', 'run_1')).cancel_requested).toBe(true);
     expect(m.calls[3]).toMatchObject({ method: 'POST', url: `${R}/run_1/cancel` });
     await expect(a.runs.cancel('t_1', 'run_1')).rejects.toMatchObject({ status: 409, code: 'run_already_ended' });
+  });
+
+  it('reads the billed and the real cost and the answer guard of a run', async () => {
+    const answerCheck = {
+      labels: ['retrieved'],
+      findings: [{ rule: 'untrusted_link', label: 'retrieved', at: '/answer' }],
+      action: 'redacted',
+    } as const;
+    const m = mockFetch(
+      json({ ...consoleRun, status: 'succeeded', cost_usd: 0.01, model_cost_usd: 0.0021, answer_check: answerCheck }),
+      json({ ...consoleRun, status: 'succeeded', cost_usd: 0.003 }),
+    );
+    const a = admin(m.fetch);
+    const run = await a.runs.get('t_1', 'run_1');
+    expect([run.cost_usd, run.model_cost_usd]).toEqual([0.01, 0.0021]);
+    expect(run.answer_check).toEqual(answerCheck);
+    // Absent when the output carried no untrusted labels (or the data key cannot be opened).
+    const plain = await a.runs.get('t_1', 'run_2');
+    expect([plain.model_cost_usd, plain.answer_check]).toEqual([undefined, undefined]);
+    // The console and the data plane share one AnswerCheck.
+    expectTypeOf<NonNullable<ConsoleRun['answer_check']>>().toEqualTypeOf<AnswerCheck>();
+    expectTypeOf<NonNullable<NodeRun['answer_check']>>().toEqualTypeOf<AnswerCheck>();
+    expectTypeOf<RunAnswerCheck>().toEqualTypeOf<AnswerCheck>();
   });
 
   it('lists the inbox with structured approvals', async () => {
