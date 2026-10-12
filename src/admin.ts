@@ -47,6 +47,11 @@ export type ModelDiscovery =
   paths['/api/v1/providers/{providerId}/discover']['post']['responses'][200]['content']['application/json'];
 export type DatasourceKind = Schemas['DatasourceKind'];
 export type Datasource = Schemas['Datasource'];
+/**
+ * `pending` when created; `introspecting` while an introspection job runs, then `ready` or `failed`
+ * (see the job's `error`). `connected` and `error` are reserved: core does not set them yet.
+ */
+export type DatasourceStatus = NonNullable<Datasource['status']>;
 export type DatasourceCreate = Schemas['DatasourceCreate'];
 /**
  * An element as proposed with `ontology.propose()` (contract: `OntologyElementProposal`):
@@ -482,7 +487,8 @@ export class CalibanAdmin {
      * Start the ontology bootstrap (`202`): connect with the datasource's credentials, check the
      * principal is read only, sample every collection and write proposals (`status: 'proposed'`) in
      * one ontology version. Elements a human already reviewed, and unchanged ones, are skipped.
-     * MongoDB only. Resolves to the `job_id` and the `job`; follow it with `introspection()`.
+     * MongoDB only. Resolves to the `job_id` and the `job`; follow it with `introspection()`. A 409
+     * while a job of the datasource runs, on any replica.
      */
     introspect: (datasourceId: string, opts?: AdminRequestOptions): Promise<IntrospectStarted> =>
       unwrap(
@@ -490,7 +496,9 @@ export class CalibanAdmin {
       ),
     /**
      * The newest introspection job of the datasource (`running`, `succeeded` or `failed`, with the
-     * counts and the ontology `version` it wrote). Answered by the control plane that ran it; a 404
+     * counts and the ontology `version` it wrote). Jobs are stored, so every control-plane replica
+     * answers; a job whose control plane stopped before it ended shows as `failed` once it is older
+     * than the job timeout (10 minutes) and a minute, and may be started again. A 404
      * `CalibanAPIError` when there is none.
      */
     introspection: (datasourceId: string, opts?: AdminRequestOptions): Promise<IntrospectionJob> =>

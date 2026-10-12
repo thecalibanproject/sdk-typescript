@@ -8,6 +8,7 @@ import type {
   ChatCompletion,
   ChatCompletionCreateParams,
   CreateEmbeddingResponse,
+  DatasourceStatus,
   EmbeddingCreateParams,
   IntentDecision,
   IntrospectionJob,
@@ -228,6 +229,7 @@ describe('contract alignment (type-level)', () => {
     expectTypeOf<OntologyDecision>().toEqualTypeOf<'approve' | 'reject' | 'deprecate'>();
     expectTypeOf<RagModel['trust_tier']>().toEqualTypeOf<TrustTier>();
     expectTypeOf<IntrospectionJob['version']>().toEqualTypeOf<number | null>();
+    expectTypeOf<DatasourceStatus>().toEqualTypeOf<'pending' | 'introspecting' | 'ready' | 'failed' | 'connected' | 'error'>();
     expectTypeOf<TenantIntentSet['source']>().toExtend<NonNullable<TenantIntent['source']>>();
     expectTypeOf<TenantIntentSet>().toEqualTypeOf<Schemas['TenantIntentSet']>();
     expectTypeOf<paths['/api/v1/tenants/{tenantId}/intents/{intent}']['put']['responses'][200]['content']['application/json']>().toEqualTypeOf<TenantIntentSet>();
