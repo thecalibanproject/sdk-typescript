@@ -45,6 +45,7 @@ export interface paths {
                         "x-caliban-routed-model"?: string;
                         /** @description Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model. */
                         "x-caliban-intent"?: string;
+                        "Server-Timing": components["headers"]["ServerTiming"];
                         /** @description `hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request. */
                         "x-caliban-cache"?: "hit" | "miss" | "bypass";
                         /** @description Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters. */
@@ -128,6 +129,7 @@ export interface paths {
                         "x-caliban-routed-model"?: string;
                         /** @description Routing decision: `<intent>;confidence=<0..1>;stage=<rules|knn|keyword>`, plus `;knn=<reason>` (timeout, embed_error, unavailable, no_text, abstain_oos, abstain_confidence, abstain_margin, abstain_empty) when kNN was on but did not decide. The intent is `pinned` for a named model. */
                         "x-caliban-intent"?: string;
+                        "Server-Timing": components["headers"]["ServerTiming"];
                         /** @description `hit` for both cache tiers (see `x-caliban-cache-tier`); `miss` when a cache applied but had no answer; `bypass` when no cache applies to the request. */
                         "x-caliban-cache"?: "hit" | "miss" | "bypass";
                         /** @description Only on hits. `exact`: byte-identical (pseudonymised) request. `semantic`: an earlier, semantically similar request of the same tenant with the same model, system prompt, history and parameters. */
@@ -300,6 +302,7 @@ export interface paths {
                         "x-caliban-routed-model"?: string;
                         /** @description Entities masked before an external provider */
                         "x-caliban-pii-entities"?: number;
+                        "Server-Timing": components["headers"]["ServerTiming"];
                         [name: string]: unknown;
                     };
                     content: {
@@ -364,6 +367,7 @@ export interface paths {
                     headers: {
                         "x-caliban-request-id"?: string;
                         "x-caliban-routed-model"?: string;
+                        "Server-Timing": components["headers"]["ServerTiming"];
                         [name: string]: unknown;
                     };
                     content: {
@@ -1473,6 +1477,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tenantId}/runs/{runId}/golden-case": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantId: components["parameters"]["TenantId"];
+                runId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Turn a finished run into a golden case
+         * @description Production feedback for the eval loop (research note 04, sections 6 and 7). Builds a case
+         *     from the run and appends it to the golden set of the run's version (or of `version`, a
+         *     version of the same node): the run's input, its human steps' answers as scripted
+         *     `answers`, a `json_schema` check when the version has an output schema; for `good`, an
+         *     `llm_judge` check with the run's output as `reference` and a `tool_call` check for each
+         *     write tool it called; for `bad`, an `llm_judge` check whose rubric is the `note`. The case
+         *     id is the run id. The set gets a new hash like an edit (a compare-and-set on the hash read,
+         *     so concurrent edits are not lost). A `mast_label` is stored on the run. Needs `nodes.write`
+         *     (what editing a golden set needs); the `case` is returned with `runs.data`. Audited as
+         *     `node.golden_set.capture` (ids, verdict, label, counts and hashes; never the note or
+         *     content). See docs/evals.md ("Cases from runs").
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantId: components["parameters"]["TenantId"];
+                    runId: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["GoldenCaseCapture"];
+                };
+            };
+            responses: {
+                /** @description Appended */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CapturedGoldenCase"];
+                    };
+                };
+                403: components["responses"]["Error"];
+                /** @description No such run in this tenant (another tenant's run included), or no such version */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description The run has not finished, it is already in that golden set, or the set kept changing */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description `good` on a run that did not succeed, `bad` without a note, a label on `good`, an unknown label, an injection-suite run, or a case that does not fit the set (problems of kind `golden_set`) */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                503: components["responses"]["Error"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tenantId}/inbox": {
         parameters: {
             query?: never;
@@ -2314,7 +2406,10 @@ export interface paths {
          *     ordinary node runs on workers, through the request pipeline, as the tenant's eval key (created
          *     and managed by the control plane, see `GET .../eval-key`), or as the API key `api_key_id`
          *     when one is named (it must be active and allowed to run the node). The key's quotas apply and
-         *     its usage is metered.
+         *     its usage is metered. Trial runs (origin `eval:<eval>:<case>`) never reach a real write
+         *     tool: every call to a tool with effect `write` goes to the eval sandbox, which answers the
+         *     case's `tool_results` or a synthetic result marked `"sandbox": true`; reads call the real
+         *     tools unless scripted.
          *     `injection`: the built-in injection suite against sandboxed tools (`k` default 1); the run
          *     input is `input`, else the input of `input_case` (or the golden set's first case), whose
          *     checks then measure utility under attack. Needs `nodes.run`; audited as `node.eval.start`.
@@ -3486,8 +3581,11 @@ export interface paths {
          * Set the tenant's exemplars of an intent, over the config file's (routes.write)
          * @description At most 100 intents per tenant and 200 exemplars per intent (each 1 to 2000 characters;
          *     duplicates dropped). An empty list removes a config-file intent for this tenant. Shipped in
-         *     the snapshot: routers rebuild their kNN index without a restart. Audited as
-         *     `tenant.intent.set` with counts, never the texts.
+         *     the snapshot: routers rebuild their kNN index in the background as soon as they apply it,
+         *     without a restart, and keep the previous index until the new one is ready. The response's
+         *     `config_version` (`cp-<n>`) is the snapshot that carries the change; a router serves it
+         *     once its `GET /healthz` reports `routing.version` at `cp-<n>` or later (compare the
+         *     numbers). Audited as `tenant.intent.set` with counts, never the texts.
          */
         put: {
             parameters: {
@@ -6113,6 +6211,8 @@ export interface components {
             exemplars: string[];
             /** @enum {string} */
             source: "api";
+            /** @description The snapshot version (`cp-<n>`) that carries the change; routers serve it once their `/healthz` `routing.version` is `cp-<n>` or later */
+            config_version?: string;
         };
         IntrospectionJob: {
             id: string;
@@ -6182,6 +6282,11 @@ export interface components {
             answers?: {
                 [key: string]: unknown;
             };
+            /** @description Scripted tool results, by tool name (the manifest's, e.g. `refund`) or reference. A trial never calls a write tool (effect `write`): the eval sandbox answers this script, else a synthetic result marked `"sandbox": true` (valid against the tool's output schema when it declares one). A read tool named here answers the script too; other reads call the real tool. */
+            tool_results?: {
+                [key: string]: unknown;
+            };
+            /** @description Free labels. A case captured from a run has `captured`, its verdict and `mast:<id>`. */
             tags?: string[];
         };
         /** @description A check of the run output. Text checks see the output as text (a string as is, other JSON compact). */
@@ -6218,6 +6323,59 @@ export interface components {
             model?: string;
             /** @default 0.5 */
             threshold?: number;
+            /** @description A reference answer shown to the judge (default: the case's `expected`). A case captured from a good run holds the run's output here. */
+            reference?: unknown;
+        } | {
+            /** @constant */
+            type: "tool_call";
+            /** @description The tool: its manifest name (`refund`), its reference, or its reference without the pin (`mcp://bank/refund`) */
+            tool: string;
+            /** @description The call's arguments must contain these (objects key by key, recursively; arrays and scalars equal), as the tool or the eval sandbox received them: after the PII guard, so a tool not trusted with personal data sees surrogates */
+            args?: Record<string, never>;
+            /**
+             * @description Passes when no such call happened
+             * @default false
+             */
+            must_not_call?: boolean;
+        };
+        /**
+         * @description A MAST failure mode (arXiv 2503.13657): FM-1.1 to FM-1.5 (specification), FM-2.1 to FM-2.6 (inter-agent misalignment), FM-3.1 to FM-3.3 (task verification)
+         * @enum {string}
+         */
+        MastLabel: "disobey_task_specification" | "disobey_role_specification" | "step_repetition" | "loss_of_conversation_history" | "unaware_of_termination_conditions" | "conversation_reset" | "fail_to_ask_for_clarification" | "task_derailment" | "information_withholding" | "ignored_other_agent_input" | "reasoning_action_mismatch" | "premature_termination" | "no_or_incomplete_verification" | "incorrect_verification";
+        GoldenCaseCapture: {
+            /**
+             * @description `good`: the run did the right thing (it must have succeeded). `bad`: it did not
+             * @enum {string}
+             */
+            verdict: "good" | "bad";
+            /** @description What the right behaviour is. Required for `bad` (the judge's rubric); added to the rubric for `good` */
+            note?: string;
+            mast_label?: components["schemas"]["MastLabel"];
+            /** @description The version whose golden set receives the case (default: the run's version) */
+            version?: number;
+        };
+        CapturedGoldenCase: {
+            /** @enum {string} */
+            object: "node.golden_case";
+            run_id: string;
+            node: string;
+            /** @description The version whose golden set holds the case */
+            version: number;
+            run_version: number;
+            /** @description The run id */
+            case_id: string;
+            /** @enum {string} */
+            verdict: "good" | "bad";
+            mast_label?: components["schemas"]["MastLabel"] | null;
+            /** @description The kinds of the checks derived from the run */
+            checks: ("json_schema" | "llm_judge" | "tool_call")[];
+            /** @description The set's hash before the capture (`null`: it was created) */
+            previous_hash?: string | null;
+            golden_set: components["schemas"]["GoldenSet"];
+            /** @description The caller holds runs.data: `case` is included */
+            content_visible: boolean;
+            case?: components["schemas"]["GoldenCase"];
         };
         GoldenSet: {
             /** @enum {string} */
@@ -6276,6 +6434,8 @@ export interface components {
                 eval: string;
                 pass_rate: number;
                 bar: number;
+                /** @description Always 0: an eval with errors is inconclusive and does not pass */
+                errors?: number;
             };
             /** @description Per pinned subnode version (`name@vN`): its own evidence, or null when no gate applies to it */
             subnodes?: {
@@ -6322,13 +6482,21 @@ export interface components {
             /** @enum {string} */
             suite: "injection";
             suite_version: number;
+            /** @description Scored trials (blocked or succeeded): errors and inapplicable cases are not in them */
             trials: number;
             blocked: number;
-            /** @description Share of attacks blocked */
-            pass_rate: number;
-            attack_success_rate: number;
+            /** @description Share of the scored attacks blocked */
+            pass_rate: number | null;
+            attack_success_rate: number | null;
             attacks_succeeded: number;
+            /** @description Trials that ended on an error (a quota, the provider, a timeout, a run that could not be created): neither blocked nor succeeded */
             errors: number;
+            /** @description Errors per kind: quota, provider, timeout, run_not_created, unscored */
+            error_kinds?: {
+                [key: string]: number;
+            };
+            /** @description There are errors: the promotion gate does not accept the eval */
+            inconclusive?: boolean;
             /** @description Trials where the model followed the injection */
             attacked: number;
             /** @description Share of runs that still did their job */
@@ -6337,7 +6505,8 @@ export interface components {
                 [key: string]: {
                     trials: number;
                     blocked: number;
-                    pass_rate: number;
+                    errors?: number;
+                    pass_rate: number | null;
                 };
             };
             /** @description Cases this version offers no surface for, with why */
@@ -6351,6 +6520,10 @@ export interface components {
                 case: string;
                 trial: number;
                 blocked: boolean;
+                /** @enum {string} */
+                outcome?: "blocked" | "succeeded" | "error";
+                /** @description With outcome error */
+                error_kind?: string;
                 attacked?: boolean | null;
                 defenses?: string[] | null;
                 run_id?: string | null;
@@ -6360,12 +6533,16 @@ export interface components {
             run_status: components["schemas"]["RunStatus"];
             checks: {
                 /** @enum {string} */
-                type: "exact" | "contains" | "regex" | "json_schema" | "llm_judge";
+                type: "exact" | "contains" | "regex" | "json_schema" | "llm_judge" | "tool_call";
                 passed: boolean;
                 /** @description The judge's score (llm_judge) */
                 score?: number | null;
             }[];
             judge_usd?: number;
+            /** @description Tool calls the trial's run made (their arguments are in the sealed `detail.tool_calls`) */
+            tool_calls?: number;
+            /** @description Of them, the ones the eval sandbox answered (every write, and scripted reads): never sent to the tool */
+            sandboxed_calls?: number;
         };
         InjectionVerdict: {
             case: string;
@@ -6567,6 +6744,7 @@ export interface components {
             origin?: string;
             /** @description `api_key:<hash prefix>` */
             invoker: string;
+            mast_label?: components["schemas"]["MastLabel"];
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -6620,6 +6798,8 @@ export interface components {
             origin?: string | null;
             /** @description Taint labels the run input carries from the start (`caller`) */
             input_labels?: string[];
+            /** @description The MAST failure mode a reviewer labelled the run with when capturing it as `bad` (`POST .../runs/{runId}/golden-case`); `null` when unlabelled */
+            mast_label?: components["schemas"]["MastLabel"] | null;
             error?: string | null;
             stop_reason?: string | null;
             partial?: boolean;
@@ -6799,6 +6979,26 @@ export interface components {
              * @enum {string}
              */
             purpose?: "rag.ingest" | "rag.search";
+            timings?: components["schemas"]["UsageTimings"];
+        };
+        /** @description Per-stage durations of the request in milliseconds (the `Server-Timing` header's numbers; for streams `upstream_total_ms` and `total_ms` run to the end of the stream). A stage that did not run is absent. Durations only: the deciding routing stage is content-class and not kept. Absent on events written before this field existed (migration 0036). */
+        UsageTimings: {
+            /** @description Authentication and the rate-limit check. */
+            auth_ms?: number;
+            /** @description Classification and model choice, `embed_ms` included. */
+            route_ms?: number;
+            /** @description The routing embedder call (Stage-1 kNN). */
+            embed_ms?: number;
+            /** @description PII screening. */
+            pii_ms?: number;
+            /** @description Cache lookups (exact, then semantic). */
+            cache_ms?: number;
+            /** @description Upstream model: time to its response headers (first byte). */
+            upstream_ms?: number;
+            /** @description Upstream model: the whole call, to the end of the body or stream. */
+            upstream_total_ms?: number;
+            /** @description Request start to the usage event. */
+            total_ms?: number;
         };
         UsageReport: {
             events: components["schemas"]["UsageEvent"][];
@@ -7213,7 +7413,24 @@ export interface components {
         TenantQuery: string;
     };
     requestBodies: never;
-    headers: never;
+    headers: {
+        /**
+         * @description W3C Server-Timing: per-stage durations of this request in milliseconds, in pipeline order,
+         *     stages that did not run left out. `auth` (authentication and rate limit), `route`
+         *     (`desc`: the stage that decided, `pinned`, `rules`, `knn` or `keyword`), `embed` (the
+         *     routing embedder call, part of `route`), `pii`, `cache` (`desc`: `hit` or `miss`),
+         *     `upstream` (time to the upstream response headers), `upstream_total` (the whole upstream
+         *     call; non-streaming responses only, streams record it in the usage event's `timings`),
+         *     `node` (a node run that answered, or the run of a run API request: creating it and, when
+         *     sync, waiting for it, or delivering an answer to it; `desc` is the run id, whose step
+         *     durations are on `GET /v1/runs/{id}`; no `dur` on streams, whose headers leave before the
+         *     run ends), `total`.
+         *     Example: `auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130,
+         *     cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, total;dur=618.700`.
+         *     Absent when `[telemetry] server_timing = false`.
+         */
+        ServerTiming: string;
+    };
     pathItems: never;
 }
 export type $defs = Record<string, never>;
