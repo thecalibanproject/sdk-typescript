@@ -12,7 +12,7 @@ export { ChatCompletionStream } from './streaming.js';
 export type { StreamTextPart, StreamTextResult } from './streaming.js';
 export { reasoningText } from './reasoning.js';
 export { Runs, RunEventStream, buildRunBody, validateUntrusted, HEADER_RUN_ID } from './runs.js';
-export { CalibanAdmin, DEFAULT_CONTROL_PLANE_URL, encodeModelIdPath } from './admin.js';
+export { CalibanAdmin, DEFAULT_CONTROL_PLANE_URL, encodeModelIdPath, isEvalDone, isPendingVerdict } from './admin.js';
 export type * from './admin.js';
 export { defineNode } from './node.js';
 export type * from './node.js';

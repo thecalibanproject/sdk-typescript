@@ -324,24 +324,26 @@ const { data } = await admin.raw.GET('/api/v1/health');
 | Helper | Methods |
 |---|---|
 | `tenants` | `list` (`{ include_deleted }`), `create`, `get`, `update`, `delete` |
-| `apiKeys` | `list` (`{ include_revoked }`), `create`, `revoke` |
+| `apiKeys` | `list` (`{ include_revoked }`), `create`, `update` (node allowlist and datasource scopes), `revoke` |
 | `providerKeys` | `list`, `create`, `delete` (the server crypto-shreds the secret) |
 | `models` | `list`, `create`, `delete` |
 | `providers` | `list`, `create`, `delete`, `health`, `discover` |
 | `datasources` | `list`, `create`, `delete`, `introspect`, `introspection` |
 | `ontology` | `get`, `review`, `reviewBatch`, `propose` |
 | `intents` | `list`, `put`, `delete` (the tenant's `caliban/auto` exemplars) |
-| `nodes` | `list`, `create`, `delete` |
+| `nodes` | `list`, `summaries`, `create`, `versions`, `getVersion`, `createVersion`, `publish`, `promote`, `retire`, `diff`, `delete` |
 | `goldenSets` | `get`, `put`, `delete` (per node version) |
 | `evalPolicy` | `get`, `put` (per node: the promotion bar) |
 | `evals` | `start`, `list`, `get`, `trials`, `cancel`, `gate` |
 | `evalKey` | `get`, `rotate` (the tenant's eval key) |
-| `runs` | `list`, `get`, `input`, `cancel` (a tenant's node runs, as the console sees them) |
+| `runs` | `list`, `get`, `input`, `cancel`, `captureGoldenCase` (a tenant's node runs, as the console sees them) |
 | `inbox` | `list` (runs waiting for a human) |
 | `rag` | `models`, `collections.{list, create, get, delete}`, `documents.{list, ingest, get, delete, release}` |
-| `usage` | `get` |
+| `usage` | `get`, `nodeSpend` (node spend today and this month against the tenant's caps) |
 | `health()` | `GET /api/v1/health` |
 | `raw` | the underlying `openapi-fetch` client |
+
+Tool servers, routes, the audit log, KEK status, roles, users and role bindings have no helper yet: call them through `raw`, which is typed from the same contract.
 
 Options: `token`, `baseUrl`, `timeoutMs` (default `60_000`, including the body read), `retry`, `headers`, `fetch`. Each helper also takes `{ signal, headers }` as its last argument. Non-2xx responses throw `CalibanAPIError`. Retries follow the same rules as the data-plane client: GET and DELETE retry on 429, 502 and 503, while POST and PATCH retry only on 429 and 503 unless you pass an `Idempotency-Key` in `headers`.
 
@@ -467,6 +469,33 @@ if (v.status === 'quarantined') {
 - A finding's `heading_path` gives the headings above the chunk it was found in, so a reviewer can find the place in the source. It is pseudonymised like the indexed text and is never an excerpt of what triggered the finding.
 - Released text is still labelled `retrieved` in node runs: a tainted write it inspires needs an allowlist entry or a human approval.
 
+#### Node versions: publish and make live
+
+A node version is created as a `draft`, published (validated against the tenant, sealed and shipped to routers and workers), made live, and eventually retired. Versions are immutable: a change is a new version. `live` marks the version the promotion pointer names: what `POST /v1/nodes/{name}/runs` without a version, and `model: 'node/<name>'`, run.
+
+```ts
+const t = tenant.id;
+const draft = await admin.nodes.createVersion(t, 'desk', spec);            // { version: 3, state: 'draft', hash }
+
+// "Go live": publish without promoting, evaluate, check the gate, then promote.
+await admin.nodes.publish(t, 'desk', draft.version, { promote: false });
+const ev = await admin.evals.start(t, 'desk', draft.version, { suite: 'golden', k: 3 });
+// ... poll admin.evals.get(t, ev.id) until isEvalDone(it) (and an injection eval for write tools)
+const gate = await admin.evals.gate(t, 'desk', draft.version);
+if (gate.allowed) await admin.nodes.promote(t, 'desk', draft.version);    // { live: true }
+
+const { live, versions } = await admin.nodes.versions(t, 'desk');          // oldest first
+await admin.nodes.promote(t, 'desk', 2);                                   // roll back
+const diff = await admin.nodes.diff(t, 'desk', 2, 3);                      // changes: [{ path, op, from, to }]
+await admin.nodes.retire(t, 'desk', 1);                                    // final; running runs finish on it
+const perNode = await admin.nodes.summaries({ tenant_id: t });             // live and latest version per node
+```
+
+- `publish()` promotes by default (`{ promote: true }`). A version with write tools, or a node with a golden bar, cannot be promoted as a draft (it has no evals yet): that is a `422` with problems of kind `eval_gate`. Publish it with `{ promote: false }`, run its evals, then `promote()`.
+- `promote()` checks the version's budgets against the tenant's `node_caps` and its latest finished evals against the promotion bar, its pinned subnodes' too (a `422`); `evals.gate()` gives the same answer in advance. A draft or a retired version is a `409`.
+- `retire()` is final. New runs of the version are refused; a version another published version still calls (`node://`) is a `409`.
+- `nodes.create({ tenant_id, name, spec })` is `createVersion()` with the tenant and the name in the body.
+
 #### Node runs and the inbox
 
 The admin client sees a tenant's node runs as the console does: `runs.list(tenantId, query)` and `runs.get(tenantId, runId)` need `runs.read`, and include content (`input`, `output`, step outputs, the question) only with `runs.data` (`content_visible`). `runs.input()` and `runs.cancel()` need `runs.answer` and are recorded with the caller's identity (`node.run.answer`, `node.write.approve`, `node.write.deny`, `node.run.cancel`). `inbox.list(tenantId)` lists the runs waiting for a human, oldest wait first; an approval carries `approval` (the tool, its effect, the untrusted taint labels its arguments carry, and the `arguments` with `runs.data`). A run from `runs.get()` carries its cost as the data plane's run does: `cost_usd` (billed; the flat auto price for a run `caliban/auto` started) and `model_cost_usd` (the real cost of the models its calls were routed to), and `answer_check` (`AnswerCheck`, shared with `NodeRun`) with `runs.read`: metadata only (labels, rules, JSON pointers, the action), never text. It is absent when the output carried no untrusted labels or the data key cannot be opened.
@@ -479,6 +508,23 @@ for (const item of data.filter((i) => i.kind === 'approval')) {
 }
 await admin.runs.cancel(tenant.id, stuckRunId); // 409 if it already ended otherwise
 ```
+
+A run's `steps` are its timeline (`ConsoleRunStep`): the step id, vertex, kind, status, tokens, cost (`usd`, `model_cost_usd`), `started_at` and `duration_ms`, and its output with `runs.data`.
+
+**Save a run as a test.** `runs.captureGoldenCase(tenantId, runId, body)` turns a finished run into a case of its version's golden set (`nodes.write`), so production feedback feeds the eval loop. The case id is the run id; it takes the run's input and its human answers. `good` (the run must have succeeded) adds an `llm_judge` check with the run's output as `reference` and a `tool_call` check for each write it made; `bad` needs a `note`, which becomes the judge's rubric, and may carry a `mast_label` (`MastLabel`, a MAST failure mode), which is also stored on the run (`mast_label` on `runs.get()` and `runs.list()`).
+
+```ts
+await admin.runs.captureGoldenCase(t, runId, { verdict: 'good' });
+const c = await admin.runs.captureGoldenCase(t, otherRunId, {
+  verdict: 'bad',
+  note: 'It must ask for the invoice number before refunding.',
+  mast_label: 'premature_termination',
+  // version: 3, // another version of the same node; default: the run's version
+});
+console.log(c.case_id, c.checks, c.golden_set.hash); // the case itself is in c.case with runs.data
+```
+
+A `409` when the run has not finished, is already in that golden set, or the set kept changing (the capture is a compare-and-set on the set's hash); a `422` for `good` on a run that did not succeed, `bad` without a note, a label on `good`, or an injection-suite run. Like any POST it is not retried on 502.
 
 #### Node evals
 
@@ -522,7 +568,10 @@ else console.log(gate.evidence);                 // GateEvidence: golden, inject
 ```
 
 - **The eval key.** Without `api_key_id`, trials and judge calls run as the tenant's eval key: an API key the control plane creates on the first such eval and manages (`purpose: 'eval'`). Its quotas apply and its usage is the eval's. `evalKey.get(tenantId)` shows it (`key` is `null` before that first eval; the plaintext is never returned, and the data plane refuses it on its endpoints); `evalKey.rotate(tenantId)` revokes it and creates a new one (`revoked` is the old id), so rotate between evals: evals in flight lose their key. `apiKeys.revoke()` on the eval key is a `409`. Pass `api_key_id` to run an eval as one of the tenant's own keys instead (active, allowed to run the node).
-- `summary` and each trial's `verdict` follow the eval's suite: narrow on `summary.suite` (`GoldenSummary` or `InjectionSummary`); a verdict is a `GoldenVerdict` (run status and each check's result), an `InjectionVerdict` (category, `succeeded`, `attacked`, the defenses that held) or `{ error }` when the trial's run could not be created. Run retention purges trial `detail` (`content_purged: true`); summaries and verdicts stay.
+- `summary` and each trial's `verdict` follow the eval's suite: narrow on `summary.suite` (`GoldenSummary` or `InjectionSummary`); a verdict is a `GoldenVerdict` (run status, each check's result, and the trial's `tool_calls` and `sandboxed_calls`), an `InjectionVerdict` (category, `succeeded`, `attacked`, the defenses that held) or `{ error }` when the trial's run could not be created. Run retention purges trial `detail` (`content_purged: true`); summaries and verdicts stay.
+- **Evals in flight.** While an eval is `pending` or `running`, `summary` is `null` and `evals.get()` already lists its trials: a trial still running (`status: 'running'`) has an empty verdict, `{}` (`PendingVerdict`). `isEvalDone(ev)` and `isPendingVerdict(trial.verdict)` tell them apart, so a progress view can count scored trials as they land.
+- **Errors are not failures.** A trial that ends on a quota, the provider, a timeout or a run that could not be created is an error: an injection summary then reports `errors`, `error_kinds` and `inconclusive: true`, its `pass_rate` and `attack_success_rate` are `null` when no trial was scored, and the gate does not accept it.
+- **Write tools never run in an eval.** Every call to a tool with effect `write` goes to the eval sandbox, which answers the case's `tool_results` (by tool name or reference) or a synthetic result marked `"sandbox": true`; reads call the real tools unless scripted. A `tool_call` check (`{ type: 'tool_call', tool, args?, must_not_call? }`) asserts on those calls, and an `llm_judge` check takes a `reference` answer.
 - `evals.list(tenantId, { node, version, suite, status, limit, cursor })` returns one page (`data`, `next_cursor`), newest first, metrics and never content. `evals.trials(tenantId, evalId)` is `evals.get()` and its `trials`; each trial's `detail` (outputs, what the scorers said) is only there when the caller holds `runs.data`, and so are golden set `cases` (`content_visible`).
 - **Read-only versions.** A version with read tools that bring data in (MCP, `builtin://datasource_query`, `builtin://rag_search`) and no write tool needs an injection eval too, because what it reads can steer its answer (the suite's `answer_integrity` cases). `evalPolicy.put(t, node, { injection: { min_pass_rate: 1, read_only: 'optional' } })` lets such versions promote without one (`InjectionReadOnly`); a finished injection eval is still checked against the bar. `evals.gate()` reports `has_untrusted_reads` next to `has_write_tools`.
 - `evals.cancel()` ends a pending eval at once and asks a running one to stop (`cancel_requested: true`); an eval that already ended throws a `409`.
