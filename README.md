@@ -56,7 +56,44 @@ npm install /path/to/sdk-typescript/caliban-sdk-0.1.0.tgz
 
 ## Quick start
 
-You need a running Caliban gateway and a tenant API key (`cal_…`).
+You need a running Caliban gateway and a tenant API key (`cal_…`). The gateway is on `http://localhost:8080` by default.
+
+### Point your existing app at Caliban
+
+If your app already uses the OpenAI or the Anthropic SDK, you do not need this package to start. Change two things, the base URL and the key, and keep your code:
+
+```ts
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  baseURL: 'http://localhost:8080/v1',   // was https://api.openai.com/v1
+  apiKey: process.env.CALIBAN_API_KEY,    // a tenant key, cal_…
+});
+const r = await openai.chat.completions.create({
+  model: 'caliban/auto', // or any model id from GET /v1/models
+  messages: [{ role: 'user', content: 'Which invoices are overdue for ACME?' }],
+});
+```
+
+```ts
+import Anthropic from '@anthropic-ai/sdk';
+
+const anthropic = new Anthropic({
+  baseURL: 'http://localhost:8080',      // the gateway root: the SDK adds /v1/messages
+  apiKey: process.env.CALIBAN_API_KEY,    // sent as x-api-key, which Caliban accepts
+});
+const msg = await anthropic.messages.create({
+  model: 'caliban/auto',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: 'Which invoices are overdue for ACME?' }],
+});
+```
+
+Every request now goes through the tenant's PII screening, cache and routing. `caliban/auto` lets the router pick the model; a model id you already use keeps working if the tenant has it (`GET /v1/models` lists them). To see what Caliban did, read the `x-caliban-*` response headers (with `.withResponse()` in both SDKs), or open the tenant's usage in the console. [Using the stock OpenAI and Anthropic SDKs](#using-the-stock-openai-and-anthropic-sdks) shows how to pass the `caliban` options through them.
+
+### With this SDK
+
+`CalibanClient` speaks the same OpenAI wire format, types the `caliban` options and parses the response headers for you:
 
 ```ts
 import { CalibanClient } from '@caliban/sdk';
@@ -75,6 +112,8 @@ const completion = await caliban.chat.completions.create({
 console.log(completion.choices[0]?.message?.content);
 console.log(completion.meta.routedModel, completion.meta.cache, completion.meta.piiEntities);
 ```
+
+A missing key throws a `CalibanError` (`configuration_error`) that names the fix: pass `apiKey` or set `CALIBAN_API_KEY`.
 
 ## Core concepts
 
