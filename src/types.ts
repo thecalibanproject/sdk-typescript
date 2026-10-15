@@ -249,6 +249,16 @@ export interface IntentDecision {
 }
 
 /** Caliban metadata parsed from data-plane response headers. */
+/**
+ * One `Server-Timing` metric: its `name`, `dur` in milliseconds (absent on `node` for streams),
+ * and `desc` (`route`: the deciding stage; `cache`: `hit` or `miss`; `node`: the run id).
+ */
+export interface ServerTimingEntry {
+  name: string;
+  dur?: number;
+  desc?: string;
+}
+
 export interface CalibanResponseMeta {
   /** `x-caliban-request-id` */
   requestId: string | null;
@@ -286,6 +296,12 @@ export interface CalibanResponseMeta {
   runId?: string;
   /** `x-caliban-run-status`: the status of that run (`succeeded`, `input_required`, ...). */
   runStatus?: string;
+  /**
+   * `Server-Timing`, parsed: the gateway's per-stage durations in pipeline order (`auth`, `route`,
+   * `embed`, `pii`, `cache`, `upstream`, `upstream_total`, `node`, `total`). `undefined` when the
+   * header is absent (`[telemetry] server_timing = false`) or has no valid entry.
+   */
+  serverTiming?: ServerTimingEntry[];
   /** HTTP status of the response. */
   status: number;
   /** All response headers. */

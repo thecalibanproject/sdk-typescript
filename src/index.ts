@@ -47,6 +47,7 @@ export {
   parseResponseMeta,
   parseCacheTier,
   parseIntentHeader,
+  parseServerTiming,
   HEADER_REQUEST_ID,
   HEADER_ROUTED_MODEL,
   HEADER_CACHE,
@@ -58,6 +59,7 @@ export {
   HEADER_ROUTE,
   HEADER_ROUTE_FALLBACK,
   HEADER_RUN_STATUS,
+  HEADER_SERVER_TIMING,
 } from './meta.js';
 export type * from './types.js';
 export type { paths, components } from './generated/schema.js';
