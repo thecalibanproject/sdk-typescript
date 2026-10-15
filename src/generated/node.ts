@@ -56,6 +56,10 @@ export interface NodeSpec {
      * writes, and reads that reach the network through their arguments: taint labels the arguments may carry without a human approval (tool:<server>/*, datasource, caller, *)
      */
     allow_tainted?: string[];
+    /**
+     * Golden eval trials answer every mcp:// tool from the eval sandbox (the case's tool_results, else a synthetic result marked sandbox: true). true lets trials call this tool for real: mcp:// tools with effect read only (a write never leaves the sandbox; anything else is refused). Built-in tools always run live.
+     */
+    eval_live?: boolean;
     [k: string]: unknown;
   }[];
   datasources?: {
