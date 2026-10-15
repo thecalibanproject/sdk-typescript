@@ -12,9 +12,11 @@ import {
   HEADER_ROUTED_MODEL,
   HEADER_RUN_ID,
   HEADER_RUN_STATUS,
+  HEADER_SERVER_TIMING,
   parseCacheTier,
   parseIntentHeader,
   parseResponseMeta,
+  parseServerTiming,
 } from '../src/index.js';
 import { completion, fastRetry, json, mockFetch, sse } from './helpers.js';
 
@@ -214,5 +216,44 @@ describe('/v1/messages responses', () => {
       'run_m1',
       'succeeded',
     ]);
+  });
+});
+
+describe('Server-Timing', () => {
+  const value =
+    'auth;dur=0.210, route;dur=4.810;desc="knn", embed;dur=4.020, pii;dur=1.130, cache;dur=0.040;desc="miss", upstream;dur=182.400, upstream_total;dur=611.900, total;dur=618.700';
+
+  it('parses every stage in order, with its duration and description', () => {
+    const t = parseServerTiming(value);
+    expect(t?.map((e) => e.name)).toEqual(['auth', 'route', 'embed', 'pii', 'cache', 'upstream', 'upstream_total', 'total']);
+    expect(t?.[1]).toEqual({ name: 'route', dur: 4.81, desc: 'knn' });
+    expect(t?.[4]).toEqual({ name: 'cache', dur: 0.04, desc: 'miss' });
+    expect(t?.at(-1)).toEqual({ name: 'total', dur: 618.7 });
+  });
+
+  it('keeps a node stage without a duration (streams) and quoted separators in desc', () => {
+    expect(parseServerTiming('node;desc="run_1", total;dur=3')).toEqual([
+      { name: 'node', desc: 'run_1' },
+      { name: 'total', dur: 3 },
+    ]);
+    expect(parseServerTiming('x;desc="a, b; c"')).toEqual([{ name: 'x', desc: 'a, b; c' }]);
+  });
+
+  it('skips nameless entries and bad durations, and never throws', () => {
+    expect(parseServerTiming(undefined)).toBeUndefined();
+    expect(parseServerTiming('  ')).toBeUndefined();
+    expect(parseServerTiming(', ;dur=1')).toBeUndefined();
+    expect(parseServerTiming('auth;dur=abc, pii;dur=-1')).toEqual([{ name: 'auth' }, { name: 'pii' }]);
+  });
+
+  it('is on response meta when the gateway sends it, and absent otherwise', async () => {
+    expect(meta({ [HEADER_SERVER_TIMING]: 'auth;dur=1, total;dur=2' }).serverTiming).toEqual([
+      { name: 'auth', dur: 1 },
+      { name: 'total', dur: 2 },
+    ]);
+    expect(meta({}).serverTiming).toBeUndefined();
+    const m = mockFetch(json(completion, { headers: { 'server-timing': value } }));
+    const res = await client(m.fetch).chat.completions.create({ model: 'caliban/auto', messages: msgs });
+    expect(res.meta.serverTiming?.find((e) => e.name === 'upstream')?.dur).toBe(182.4);
   });
 });

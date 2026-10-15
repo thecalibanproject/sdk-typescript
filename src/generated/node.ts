@@ -164,6 +164,9 @@ export interface NodeSpec {
     }[];
     [k: string]: unknown;
   };
+  /**
+   * Informational. Golden sets are stored per version through the admin API (docs/evals.md); their cases follow $defs/golden_case.
+   */
   eval?: {
     suite?: string;
     metrics?: string[];

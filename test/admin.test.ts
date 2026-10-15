@@ -6,9 +6,12 @@ import {
   CalibanConnectionError,
   CalibanOntologyBreakingError,
   defineNode,
+  isEvalDone,
   isOntologyBreakingError,
+  isPendingVerdict,
   ONTOLOGY_BREAKING_CHANGE,
   type ConsoleRun,
+  type ConsoleRunStep,
   type Eval,
   type EvalCheck,
   type EvalGate,
@@ -19,17 +22,22 @@ import {
   type EvalSuite,
   type EvalTrial,
   type GoldenCase,
+  type GoldenCaseCapture,
   type GoldenSummary,
   type GoldenVerdict,
   type InjectionReadOnly,
+  type InjectionSummary,
   type InjectionVerdict,
   type OntologyBreaking,
   type OntologyElement,
   type OntologyElementProposal,
   type OntologyProposalResult,
+  type PendingVerdict,
   type PiiPattern,
   type PiiTerm,
+  type MastLabel,
   type NodeRun,
+  type NodeState,
   type Problem,
   type RunAnswerCheck,
   type Tenant,
@@ -633,7 +641,9 @@ describe('CalibanAdmin node evals', () => {
     expectTypeOf<EvalStatus>().toEqualTypeOf<'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'>();
     expectTypeOf<Extract<EvalCheck, { type: 'json_schema' }>['schema']>().toEqualTypeOf<Record<string, unknown>>();
     expectTypeOf<Extract<NonNullable<Eval['summary']>, { suite: 'golden' }>>().toEqualTypeOf<GoldenSummary>();
-    expectTypeOf<NonNullable<EvalTrial['verdict']>>().toEqualTypeOf<GoldenVerdict | InjectionVerdict | { error: string }>();
+    expectTypeOf<NonNullable<EvalTrial['verdict']>>().toEqualTypeOf<
+      GoldenVerdict | InjectionVerdict | { error: string } | PendingVerdict
+    >();
     expectTypeOf<NonNullable<EvalGate['problems']>>().toEqualTypeOf<Problem[]>();
     expectTypeOf<Awaited<ReturnType<CalibanAdmin['evalPolicy']['put']>>>().toEqualTypeOf<EvalPolicyView>();
     // @ts-expect-error a check needs a known type
@@ -980,5 +990,277 @@ describe('CalibanAdmin: ontology bootstrap, intents and document collections', (
 
     await a.rag.documents.delete('t_1', 'policies', 'leave-policy');
     expect(m.calls[4]).toMatchObject({ method: 'DELETE', url: `${D}/leave-policy` });
+  });
+});
+
+describe('CalibanAdmin: evals in flight', () => {
+  it('parses a running eval: no summary yet, trials running with an empty verdict', async () => {
+    const running = {
+      ...evalBody,
+      status: 'running',
+      summary: null,
+      claims: 1,
+      cancel_requested: false,
+      content_purged: false,
+      started_at: '2026-10-11T00:00:01Z',
+      finished_at: null,
+      content_visible: false,
+      trials: [
+        { case: 'chest', trial: 0, run_id: 'run_1', status: 'running', cost_usd: 0, latency_ms: 0, tokens: 0, verdict: {}, finished_at: null },
+        {
+          case: 'refund',
+          trial: 0,
+          run_id: 'run_2',
+          status: 'passed',
+          cost_usd: 0.002,
+          latency_ms: 900,
+          tokens: 300,
+          verdict: {
+            run_status: 'succeeded',
+            checks: [{ type: 'tool_call', passed: true }],
+            tool_calls: 2,
+            sandboxed_calls: 1,
+          },
+          finished_at: '2026-10-11T00:00:02Z',
+        },
+        { case: 'chest', trial: 1, run_id: null, status: 'error', cost_usd: 0, latency_ms: 0, tokens: 0, verdict: { error: 'quota' }, finished_at: 'x' },
+      ],
+    };
+    const m = mockFetch(json(running));
+    const ev = await admin(m.fetch).evals.get('t_1', 'ev_1');
+    expect(isEvalDone(ev)).toBe(false);
+    expect(ev.summary).toBeNull();
+    const [inFlight, scored, failed] = ev.trials ?? [];
+    expect(isPendingVerdict(inFlight?.verdict)).toBe(true);
+    expect(isPendingVerdict(scored?.verdict)).toBe(false);
+    expect(isPendingVerdict(failed?.verdict)).toBe(false);
+    const verdict = scored?.verdict as GoldenVerdict;
+    expect([verdict.checks[0]?.type, verdict.tool_calls, verdict.sandboxed_calls]).toEqual(['tool_call', 2, 1]);
+    expect(isEvalDone({ status: 'cancelled' })).toBe(true);
+    expect(isPendingVerdict(undefined)).toBe(true);
+  });
+
+  it('reads an inconclusive injection summary whose rates are null', async () => {
+    const summary: InjectionSummary = {
+      suite: 'injection',
+      suite_version: 3,
+      trials: 0,
+      blocked: 0,
+      pass_rate: null,
+      attack_success_rate: null,
+      attacks_succeeded: 0,
+      errors: 2,
+      error_kinds: { quota: 1, timeout: 1 },
+      inconclusive: true,
+      attacked: 0,
+      utility_under_attack: 0,
+      by_category: { tainted_write: { trials: 0, blocked: 0, errors: 2, pass_rate: null } },
+      not_applicable: [],
+      cost_usd: 0,
+      latency_ms: { p50: null, p95: null },
+      cases: [{ case: 'tw-1', trial: 0, blocked: false, outcome: 'error', error_kind: 'quota' }],
+    };
+    const m = mockFetch(json({ ...evalBody, suite: 'injection', k: 1, status: 'succeeded', summary }));
+    const ev = await admin(m.fetch).evals.get('t_1', 'ev_1');
+    if (ev.summary?.suite !== 'injection') throw new Error('expected an injection summary');
+    expect([ev.summary.pass_rate, ev.summary.inconclusive, ev.summary.cases[0]?.outcome]).toEqual([null, true, 'error']);
+  });
+
+  it('writes golden cases with scripted tool results and tool_call checks', () => {
+    const c: GoldenCase = {
+      id: 'refund-ok',
+      input: { ticket: 'refund INV-1' },
+      tool_results: { lookup_invoice: { id: 'INV-1', amount: 40 } },
+      checks: [
+        { type: 'tool_call', tool: 'mcp://bank/refund', args: { invoice: 'INV-1' } },
+        { type: 'tool_call', tool: 'delete_account', must_not_call: true },
+        { type: 'llm_judge', rubric: 'Refunds the right invoice', reference: { refunded: 'INV-1' } },
+      ],
+    };
+    expectTypeOf<Extract<EvalCheck, { type: 'tool_call' }>['args']>().toEqualTypeOf<Record<string, unknown> | undefined>();
+    expect(c.checks).toHaveLength(3);
+  });
+});
+
+describe('CalibanAdmin: node versions, publish, promote', () => {
+  const spec = defineNode({
+    kind: 'agent',
+    prompt: { system: 'Triage.' },
+    model_policy: { model: 'caliban/auto' },
+    budgets: { steps: 4, tokens: 1000, wall_clock_s: 30 },
+  });
+  const version = (v: number, state: NodeState, live = false) => ({
+    id: `n_${v}`,
+    tenant_id: 't_1',
+    name: 'desk',
+    version: v,
+    spec,
+    hash: `sha256:${v}`,
+    state,
+    live,
+    created_at: 'x',
+  });
+
+  it('creates, lists and reads versions', async () => {
+    const m = mockFetch(
+      json(version(3, 'draft'), { status: 201 }),
+      json({ name: 'desk', live: 2, promotion: { version: 2, promoted_at: 'x', promoted_by: 'u' }, versions: [version(2, 'published', true), version(3, 'draft')] }),
+      json(version(3, 'draft')),
+      json([{ tenant_id: 't_1', name: 'desk', live_version: 2, latest: { version: 3, state: 'draft', hash: 'sha256:3' }, versions: 2, published: 1, drafts: 1, retired: 0 }]),
+    );
+    const a = admin(m.fetch);
+    const created = await a.nodes.createVersion('t_1', 'desk', spec);
+    expect([created.version, created.state, created.live]).toEqual([3, 'draft', false]);
+    expect(m.calls[0]).toMatchObject({ method: 'POST', url: `${N}/versions` });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ spec });
+    const all = await a.nodes.versions('t_1', 'desk');
+    expect([all.live, all.versions?.map((v) => v.state)]).toEqual([2, ['published', 'draft']]);
+    expect(m.calls[1]).toMatchObject({ method: 'GET', url: `${N}/versions` });
+    expect((await a.nodes.getVersion('t_1', 'desk', 3)).hash).toBe('sha256:3');
+    expect(m.calls[2]).toMatchObject({ method: 'GET', url: `${N}/versions/3` });
+    const [summary] = await a.nodes.summaries({ tenant_id: 't_1' });
+    expect([summary?.live_version, summary?.latest?.state]).toEqual([2, 'draft']);
+    expect(m.calls[3]!.url).toBe('http://cp:8081/api/v1/nodes?tenant_id=t_1&view=summary');
+  });
+
+  it('publishes without promoting, promotes, rolls back and retires', async () => {
+    const m = mockFetch(
+      json(version(3, 'published')),
+      json(version(4, 'published', true)),
+      json(version(3, 'published', true)),
+      json(version(2, 'retired')),
+    );
+    const a = admin(m.fetch);
+    expect((await a.nodes.publish('t_1', 'desk', 3, { promote: false })).live).toBe(false);
+    expect(m.calls[0]).toMatchObject({ method: 'POST', url: `${N}/versions/3/publish` });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ promote: false });
+    await a.nodes.publish('t_1', 'desk', 4);
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({});
+    expect((await a.nodes.promote('t_1', 'desk', 3)).live).toBe(true);
+    expect(m.calls[2]).toMatchObject({ method: 'POST', url: `${N}/promote` });
+    expect(JSON.parse(m.calls[2]!.body!)).toEqual({ version: 3 });
+    expect((await a.nodes.retire('t_1', 'desk', 2)).state).toBe('retired');
+    expect(m.calls[3]).toMatchObject({ method: 'POST', url: `${N}/versions/2/retire` });
+  });
+
+  it('surfaces the eval gate on a refused promotion', async () => {
+    const m = mockFetch(
+      json(
+        { error: { message: 'promotion bar not met', type: 'invalid_request_error', problems: [{ kind: 'eval_gate', message: 'no injection eval' }] } },
+        { status: 422 },
+      ),
+    );
+    await expect(admin(m.fetch).nodes.promote('t_1', 'desk', 3)).rejects.toMatchObject({ status: 422 });
+  });
+
+  it('diffs two versions', async () => {
+    const diff = {
+      name: 'desk',
+      from: { version: 2, hash: 'sha256:2', state: 'published' },
+      to: { version: 3, hash: 'sha256:3', state: 'draft' },
+      identical: false,
+      changes: [{ path: '/prompt/system', op: 'changed', from: 'Old.', to: 'Triage.' }],
+    };
+    const m = mockFetch(json(diff));
+    const d = await admin(m.fetch).nodes.diff('t_1', 'desk', 2, 3);
+    expect(d.changes?.[0]?.op).toBe('changed');
+    expect(m.calls[0]!.url).toBe(`${N}/diff?from=2&to=3`);
+  });
+});
+
+describe('CalibanAdmin: runs into golden cases, key scopes, node spend', () => {
+  const R = 'http://cp:8081/api/v1/tenants/t_1/runs';
+  const captured = {
+    object: 'node.golden_case',
+    run_id: 'run_1',
+    node: 'desk',
+    version: 2,
+    run_version: 2,
+    case_id: 'run_1',
+    verdict: 'bad',
+    mast_label: 'premature_termination',
+    checks: ['json_schema', 'llm_judge'],
+    previous_hash: 'sha256:aa',
+    golden_set: { object: 'node.golden_set', node: 'desk', version: 2, hash: 'sha256:bb', case_count: 3, updated_at: 'x', updated_by: 'u', content_visible: false },
+    content_visible: false,
+  };
+
+  it('captures a bad run with a note and a MAST label, and a good run', async () => {
+    const m = mockFetch(
+      json(captured, { status: 201 }),
+      json({ ...captured, verdict: 'good', mast_label: null, checks: ['llm_judge', 'tool_call'], content_visible: true, case: { id: 'run_1', input: {} } }, { status: 201 }),
+    );
+    const a = admin(m.fetch);
+    const bad = await a.runs.captureGoldenCase('t_1', 'run_1', {
+      verdict: 'bad',
+      note: 'It must ask for the invoice number before refunding.',
+      mast_label: 'premature_termination',
+    });
+    expect([bad.case_id, bad.golden_set.hash, bad.case]).toEqual(['run_1', 'sha256:bb', undefined]);
+    expect(m.calls[0]).toMatchObject({ method: 'POST', url: `${R}/run_1/golden-case` });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({
+      verdict: 'bad',
+      note: 'It must ask for the invoice number before refunding.',
+      mast_label: 'premature_termination',
+    });
+    const good = await a.runs.captureGoldenCase('t_1', 'run_1', { verdict: 'good', version: 2 });
+    expect([good.checks, good.case?.id]).toEqual([['llm_judge', 'tool_call'], 'run_1']);
+    expectTypeOf<GoldenCaseCapture['mast_label']>().toEqualTypeOf<MastLabel | undefined>();
+    // @ts-expect-error not a MAST failure mode
+    const label: MastLabel = 'bad_vibes';
+    expect(label).toBeDefined();
+  });
+
+  it('does not retry a capture on 502, and reports 409 and 422', async () => {
+    const m = mockFetch(
+      json({ error: { message: 'bad gateway', type: 'upstream_error' } }, { status: 502 }),
+      json({ error: { message: 'the run has not finished', type: 'conflict' } }, { status: 409 }),
+    );
+    const a = admin(m.fetch);
+    await expect(a.runs.captureGoldenCase('t_1', 'run_1', { verdict: 'good' })).rejects.toMatchObject({ status: 502 });
+    expect(m.calls).toHaveLength(1);
+    await expect(a.runs.captureGoldenCase('t_1', 'run_1', { verdict: 'good' })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('reads the MAST label and the step timeline of a run', async () => {
+    const step = { id: 'classify#0', vertex: 'classify', kind: 'llm', status: 'completed', tokens: 120, usd: 0.0004, labels: [], started_at: '2026-10-11T00:00:00Z', duration_ms: 420 };
+    const m = mockFetch(
+      json({ id: 'run_1', object: 'node.run', node: 'desk', version: 2, status: 'failed', steps: [step], budget: {}, content_visible: false, mast_label: 'step_repetition', created_at: 'x' }),
+      json({ object: 'list', data: [{ id: 'run_1', object: 'node.run', node: 'desk', version: 2, status: 'failed', cost_usd: 0, invoker: 'api_key:ab', mast_label: 'step_repetition', created_at: 'x' }], next_cursor: null }),
+    );
+    const a = admin(m.fetch);
+    const run = await a.runs.get('t_1', 'run_1');
+    expect([run.mast_label, run.steps[0]?.duration_ms]).toEqual(['step_repetition', 420]);
+    expectTypeOf(run.steps).toEqualTypeOf<ConsoleRunStep[]>();
+    expect((await a.runs.list('t_1')).data[0]?.mast_label).toBe('step_repetition');
+  });
+
+  it('changes an api key node allowlist and scopes with PATCH', async () => {
+    const key = { id: 'k1', name: 'ci', prefix: 'cal_abcd', created_at: 'x', nodes: ['desk'], datasource_scopes: ['erp.invoices:read'] };
+    const m = mockFetch(json(key), json({ ...key, nodes: null }));
+    const a = admin(m.fetch);
+    const updated = await a.apiKeys.update('t_1', 'k1', { nodes: ['desk'], datasource_scopes: ['erp.invoices:read'] });
+    expect(updated.nodes).toEqual(['desk']);
+    expect(m.calls[0]).toMatchObject({ method: 'PATCH', url: 'http://cp:8081/api/v1/tenants/t_1/api-keys/k1' });
+    expect(JSON.parse(m.calls[0]!.body!)).toEqual({ nodes: ['desk'], datasource_scopes: ['erp.invoices:read'] });
+    expect((await a.apiKeys.update('t_1', 'k1', { nodes: null })).nodes).toBeNull();
+    expect(JSON.parse(m.calls[1]!.body!)).toEqual({ nodes: null });
+  });
+
+  it('reads the tenant node spend against its caps', async () => {
+    const spend = {
+      tenant_id: 't_1',
+      day: '2026-10-15',
+      month: '2026-10',
+      today_usd: 1.25,
+      month_usd: 30,
+      caps: { daily_usd: 5, monthly_usd: null },
+      remaining: { daily_usd: 3.75, monthly_usd: null },
+      capped: false,
+    };
+    const m = mockFetch(json(spend));
+    const s = await admin(m.fetch).usage.nodeSpend('t_1');
+    expect([s.remaining.daily_usd, s.remaining.monthly_usd, s.capped]).toEqual([3.75, null, false]);
+    expect(m.calls[0]).toMatchObject({ method: 'GET', url: 'http://cp:8081/api/v1/tenants/t_1/node-spend' });
   });
 });

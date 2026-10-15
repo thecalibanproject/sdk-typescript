@@ -1,4 +1,4 @@
-import type { CacheTier, CalibanResponseMeta, IntentDecision, RouteStage, WithMeta } from './types.js';
+import type { CacheTier, CalibanResponseMeta, IntentDecision, RouteStage, ServerTimingEntry, WithMeta } from './types.js';
 
 export const HEADER_REQUEST_ID = 'x-caliban-request-id';
 export const HEADER_ROUTED_MODEL = 'x-caliban-routed-model';
@@ -11,6 +11,8 @@ export const HEADER_BILLED_USD = 'x-caliban-billed-usd';
 export const HEADER_ROUTE = 'x-caliban-route';
 export const HEADER_ROUTE_FALLBACK = 'x-caliban-route-fallback';
 export const HEADER_RUN_STATUS = 'x-caliban-run-status';
+/** W3C `Server-Timing`: the gateway's per-stage durations of the request, in milliseconds. */
+export const HEADER_SERVER_TIMING = 'server-timing';
 /** Response header naming the run a response is about (run creation, event streams, node answers). */
 export const HEADER_RUN_ID = 'caliban-run-id';
 
@@ -64,6 +66,61 @@ export function parseIntentHeader(value: string | null | undefined): IntentDecis
   return decision;
 }
 
+/**
+ * Parse a `Server-Timing` value (`auth;dur=0.210, route;dur=4.810;desc="knn", ...`) into its
+ * metrics, in order. Entries without a name are skipped; a `dur` that is not a non-negative number
+ * is left out. `undefined` when absent or empty. Never throws.
+ */
+export function parseServerTiming(value: string | null | undefined): ServerTimingEntry[] | undefined {
+  const raw = nonEmpty(value);
+  if (raw === null) return undefined;
+  const out: ServerTimingEntry[] = [];
+  for (const metric of splitOutsideQuotes(raw, ',')) {
+    const [head = '', ...params] = splitOutsideQuotes(metric, ';');
+    const name = head.trim();
+    if (name === '' || name.includes('=')) continue;
+    const entry: ServerTimingEntry = { name };
+    for (const param of params) {
+      const eq = param.indexOf('=');
+      if (eq <= 0) continue;
+      const key = param.slice(0, eq).trim().toLowerCase();
+      let v = param.slice(eq + 1).trim();
+      if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1).replace(/\\(.)/g, '$1');
+      if (key === 'dur' && entry.dur === undefined) {
+        const n = Number(v);
+        if (v !== '' && Number.isFinite(n) && n >= 0) entry.dur = n;
+      } else if (key === 'desc' && entry.desc === undefined) {
+        entry.desc = v;
+      }
+    }
+    out.push(entry);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** Split on `sep`, ignoring separators inside double-quoted strings. */
+function splitOutsideQuotes(value: string, sep: string): string[] {
+  const parts: string[] = [];
+  let cur = '';
+  let quoted = false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i]!;
+    if (quoted && c === '\\' && i + 1 < value.length) {
+      cur += c + value[++i];
+      continue;
+    }
+    if (c === '"') quoted = !quoted;
+    if (c === sep && !quoted) {
+      parts.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  parts.push(cur);
+  return parts;
+}
+
 /** Parse Caliban response headers into {@link CalibanResponseMeta}. */
 export function parseResponseMeta(response: Pick<Response, 'headers' | 'status'>): CalibanResponseMeta {
   const h = response.headers;
@@ -94,6 +151,8 @@ export function parseResponseMeta(response: Pick<Response, 'headers' | 'status'>
   if (runId !== null) meta.runId = runId;
   const runStatus = nonEmpty(h.get(HEADER_RUN_STATUS));
   if (runStatus !== null) meta.runStatus = runStatus;
+  const timing = parseServerTiming(h.get(HEADER_SERVER_TIMING));
+  if (timing !== undefined) meta.serverTiming = timing;
   return meta;
 }
 
